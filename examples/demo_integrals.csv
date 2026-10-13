@@ -1,0 +1,5 @@
+﻿sequence_index,spectrum_number,spectrum_id,source_path,integral__standard,integral__signal,status,warnings,phase_p0_deg,phase_p1_deg,peak_count,max_relative_rmse
+1,1,1.npz,examples\demo_series\1.npz,740.6153857090704,751.3976700865067,ok,,0.0,0.0,4,0.011561593511673634
+2,2,2.npz,examples\demo_series\2.npz,592.7425610370794,601.3311200347441,ok,,0.0,0.0,4,0.011542899046338715
+3,3,3.npz,examples\demo_series\3.npz,444.9496889669326,451.34753012053665,ok,,0.0,0.0,4,0.011506560811395986
+4,4,4.npz,examples\demo_series\4.npz,294.819141391807,301.5002985821762,ok,,0.0,0.0,4,0.012369016950965622

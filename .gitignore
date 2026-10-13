@@ -1,0 +1,19 @@
+.venv/
+.env/
+.runtime/
+.python/
+.appenv/
+.mplconfig/
+.tools/
+.uv.zip
+__pycache__/
+.pytest_cache/
+demo_data/
+test_output/
+
+# Local research outputs and distribution archives are not source files.
+/integrals.csv
+/integrals.settings.json
+/integrals.diagnostics.json
+/Spintegrate.original.ipynb
+/Spintegrate_GUI.zip

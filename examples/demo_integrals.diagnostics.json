@@ -1,0 +1,151 @@
+{
+  "cancelled": false,
+  "processed": 4,
+  "total": 4,
+  "spectra": [
+    {
+      "spectrum_id": "1.npz",
+      "errors": {},
+      "diagnostics": {
+        "Стандарт": {
+          "n_peaks": 2,
+          "nfev": 6,
+          "attempts": 3,
+          "solver_message": "`ftol` termination condition is satisfied.",
+          "relative_rmse": 0.011561593511673634,
+          "condition_number": 2.864684204793843,
+          "cancellation_fraction": -2.220446049250313e-16,
+          "cancellation_pairs": [],
+          "initial_width_ppm": 0.00625,
+          "width_bounds_ppm": [
+            0.0003662109375,
+            0.0625
+          ]
+        },
+        "Сигнал": {
+          "n_peaks": 2,
+          "nfev": 7,
+          "attempts": 3,
+          "solver_message": "`ftol` termination condition is satisfied.",
+          "relative_rmse": 0.009433071084896022,
+          "condition_number": 2.851332310765122,
+          "cancellation_fraction": 1.1102230246251565e-16,
+          "cancellation_pairs": [],
+          "initial_width_ppm": 0.00625,
+          "width_bounds_ppm": [
+            0.0003662109375,
+            0.0625
+          ]
+        }
+      }
+    },
+    {
+      "spectrum_id": "2.npz",
+      "errors": {},
+      "diagnostics": {
+        "Стандарт": {
+          "n_peaks": 2,
+          "nfev": 6,
+          "attempts": 3,
+          "solver_message": "`ftol` termination condition is satisfied.",
+          "relative_rmse": 0.011542899046338715,
+          "condition_number": 2.8650634629403346,
+          "cancellation_fraction": -2.220446049250313e-16,
+          "cancellation_pairs": [],
+          "initial_width_ppm": 0.00625,
+          "width_bounds_ppm": [
+            0.0003662109375,
+            0.0625
+          ]
+        },
+        "Сигнал": {
+          "n_peaks": 2,
+          "nfev": 7,
+          "attempts": 3,
+          "solver_message": "`ftol` termination condition is satisfied.",
+          "relative_rmse": 0.009394764831333955,
+          "condition_number": 2.8516078434731513,
+          "cancellation_fraction": 0.0,
+          "cancellation_pairs": [],
+          "initial_width_ppm": 0.00625,
+          "width_bounds_ppm": [
+            0.0003662109375,
+            0.0625
+          ]
+        }
+      }
+    },
+    {
+      "spectrum_id": "3.npz",
+      "errors": {},
+      "diagnostics": {
+        "Стандарт": {
+          "n_peaks": 2,
+          "nfev": 6,
+          "attempts": 3,
+          "solver_message": "`ftol` termination condition is satisfied.",
+          "relative_rmse": 0.011506560811395986,
+          "condition_number": 2.8658218869498273,
+          "cancellation_fraction": 0.0,
+          "cancellation_pairs": [],
+          "initial_width_ppm": 0.00625,
+          "width_bounds_ppm": [
+            0.0003662109375,
+            0.0625
+          ]
+        },
+        "Сигнал": {
+          "n_peaks": 2,
+          "nfev": 7,
+          "attempts": 3,
+          "solver_message": "`ftol` termination condition is satisfied.",
+          "relative_rmse": 0.009323754163121548,
+          "condition_number": 2.8521975189580826,
+          "cancellation_fraction": 0.0,
+          "cancellation_pairs": [],
+          "initial_width_ppm": 0.00625,
+          "width_bounds_ppm": [
+            0.0003662109375,
+            0.0625
+          ]
+        }
+      }
+    },
+    {
+      "spectrum_id": "4.npz",
+      "errors": {},
+      "diagnostics": {
+        "Стандарт": {
+          "n_peaks": 2,
+          "nfev": 6,
+          "attempts": 3,
+          "solver_message": "`ftol` termination condition is satisfied.",
+          "relative_rmse": 0.012369016950965622,
+          "condition_number": 2.8840758305007874,
+          "cancellation_fraction": 0.0,
+          "cancellation_pairs": [],
+          "initial_width_ppm": 0.00625,
+          "width_bounds_ppm": [
+            0.0003662109375,
+            0.0625
+          ]
+        },
+        "Сигнал": {
+          "n_peaks": 2,
+          "nfev": 7,
+          "attempts": 3,
+          "solver_message": "`ftol` termination condition is satisfied.",
+          "relative_rmse": 0.009177267937884986,
+          "condition_number": 2.853678049603555,
+          "cancellation_fraction": 2.220446049250313e-16,
+          "cancellation_pairs": [],
+          "initial_width_ppm": 0.00625,
+          "width_bounds_ppm": [
+            0.0003662109375,
+            0.0625
+          ]
+        }
+      }
+    }
+  ]
+}

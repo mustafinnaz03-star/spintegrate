@@ -1,0 +1,88 @@
+{
+  "processing": {
+    "phase": "none",
+    "abs_source": "spectrum",
+    "lb_hz": 0.0,
+    "p0": 0.0,
+    "p1": 0.0,
+    "phase_peak_width": 100,
+    "reference_mode": "metadata",
+    "reference_ppm": 7.15,
+    "reference_low": 6.8,
+    "reference_high": 7.5,
+    "ppm_offset": 0.0,
+    "zero_fill_factor": 1,
+    "remove_digital_filter": true
+  },
+  "fit": {
+    "threshold": 4000.0,
+    "min_separation_points": 2,
+    "signed": false,
+    "initial_width_hz": 5.0,
+    "min_width_hz": 0.05,
+    "max_width_hz": 50.0,
+    "max_nfev": 2000,
+    "restarts": 3,
+    "max_peaks": 150,
+    "loss": "linear",
+    "residual_warning": 0.15,
+    "cancellation_warning": 0.7
+  },
+  "baseline_default": {
+    "method": "snip",
+    "lam": 1000000.0,
+    "p": 0.01,
+    "max_iter": 50,
+    "tol": 0.001,
+    "half_window": 30,
+    "smooth_half_window": 3,
+    "poly_order": 3
+  },
+  "regions": [
+    {
+      "name": "Стандарт",
+      "low": 3.3,
+      "high": 3.85,
+      "baseline": {
+        "method": "asls",
+        "lam": 1000000.0,
+        "p": 0.001,
+        "max_iter": 50,
+        "tol": 0.001,
+        "half_window": 30,
+        "smooth_half_window": 3,
+        "poly_order": 3
+      }
+    },
+    {
+      "name": "Сигнал",
+      "low": 5.0,
+      "high": 5.55,
+      "baseline": {
+        "method": "asls",
+        "lam": 1000000.0,
+        "p": 0.001,
+        "max_iter": 50,
+        "tol": 0.001,
+        "half_window": 30,
+        "smooth_half_window": 3,
+        "poly_order": 3
+      }
+    }
+  ],
+  "integrals": [
+    {
+      "name": "standard",
+      "parent": "Стандарт",
+      "low": 3.5,
+      "high": 3.65
+    },
+    {
+      "name": "signal",
+      "parent": "Сигнал",
+      "low": 5.15,
+      "high": 5.35
+    }
+  ],
+  "schema_version": 1
+}
