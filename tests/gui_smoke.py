@@ -1,4 +1,5 @@
 """Exercise the actual Tk widgets, workers, previews and CSV export in hidden windows."""
+import csv
 import json
 import sys
 import tempfile
@@ -99,6 +100,13 @@ def main():
             app.export_single()
             assert (target/'peaks.csv').is_file()
             assert (target/'peaks.integrals.csv').is_file()
+            with (target/'peaks.integrals.csv').open(encoding='utf-8-sig') as stream:
+                single_rows = list(csv.DictReader(stream))
+            assert 'standard' in single_rows[0] and 'signal' in single_rows[0]
+            assert len(single_rows) == 1
+            gui.filedialog.asksaveasfilename = lambda **_: str(target/'single.spfit')
+            app.save_single_fit()
+            assert (target/'single.spfit').is_file()
             app.figure.savefig(Path.cwd()/'test_output'/'single_spectrum.png', dpi=130)
             popup.figure.savefig(Path.cwd()/'test_output'/'apodization_baseline.png', dpi=130)
             write_demo_series(target/'series')
@@ -110,6 +118,54 @@ def main():
             assert all(r['status'] != 'error' for r in app.batch_rows)
             assert (target/'batch.csv').is_file()
             assert len(app.batch_tree.get_children()) == 4
+            assert app.batch_tree.heading('area0')['text'] == 'standard'
+            first = app.batch_tree.get_children()[0]
+            cells = app.batch_tree.item(first, 'values')
+            assert len(cells) == 6  # number, ID, status, three area columns
+            assert '=' not in cells[3]
+            float(cells[3])
+            app.batch_tree.selection_set(first)
+            app.review_selected_fit()
+            settle()
+            review = app.review_windows[-1]
+            review.window.withdraw()
+            assert review.analysis.integrals['signal'] == app.batch_rows[0]['integral__signal']
+            assert len(review.detail_ax.lines) >= 3
+            review.selected_region.set('Сигнал')
+            review.draw()
+            assert 'Сигнал' in review.detail_ax.get_title(loc='left')
+            gui.filedialog.asksaveasfilename = lambda **_: str(target/'review.png')
+            review.save_image()
+            assert (target/'review.png').stat().st_size > 10000
+            review.figure.savefig(Path.cwd()/'test_output'/'saved_fit_review.png', dpi=130)
+            # A CSV opened after the analysis loads its own recipe and archives.
+            gui.filedialog.askopenfilename = lambda **_: str(target/'batch.csv')
+            app.open_batch_results()
+            settle()
+            app.batch_tree.selection_set(app.batch_tree.get_children()[0])
+            # Current processing controls must not affect review of saved fits.
+            app.fit_fields.vars['threshold'].set('1000000000')
+            settle()
+            before = app.read_settings()
+            app.review_selected_fit()
+            settle()
+            assert app.read_settings() == before
+            assert len(app.review_windows[-1].analysis.results['Сигнал'].centers) == 2
+            app.review_windows[-1].window.withdraw()
+            # Explicitly marked fallback for older batches with no .spfit.
+            app.batch_rows[0]['fit_file'] = ''
+            app.review_selected_fit()
+            settle()
+            fallback = app.review_windows[-1]
+            fallback.window.withdraw()
+            assert fallback.origin.startswith('ПОВТОРНЫЙ РАСЧЁТ')
+            assert len(fallback.analysis.results['Сигнал'].centers) == 2
+            gui.filedialog.askopenfilename = lambda **_: str(target/'single.spfit')
+            app.open_fit_file()
+            settle()
+            assert app.review_windows[-1].analysis.integrals['signal'] > 0
+            app.review_windows[-1].window.withdraw()
+            print('Numeric CSV columns, archived fit review, PNG, CSV reopen and legacy fallback: OK', flush=True)
             recipe = target/'peaks.settings.json'
             gui.filedialog.askopenfilename = lambda **_: str(recipe)
             app.load_settings()

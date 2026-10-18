@@ -17,3 +17,7 @@ test_output/
 /integrals.diagnostics.json
 /Spintegrate.original.ipynb
 /Spintegrate_GUI.zip
+*.fits/
+*.spfit
+!examples/demo_integrals.fits/
+!examples/demo_integrals.fits/*.spfit

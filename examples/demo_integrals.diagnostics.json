@@ -37,6 +37,19 @@
             0.0625
           ]
         }
+      },
+      "fit_file": "demo_integrals.fits/000001.spfit",
+      "row": {
+        "sequence_index": 1,
+        "spectrum_number": "1",
+        "spectrum_id": "1.npz",
+        "source_path": "C:\\Users\\User\\Documents\\ChatGPT\\spintegrate_ultimatum\\examples\\demo_series\\1.npz",
+        "status": "ok",
+        "warnings": "",
+        "phase_p0_deg": 0.0,
+        "phase_p1_deg": 0.0,
+        "peak_count": 4,
+        "max_relative_rmse": 0.011561593511673634
       }
     },
     {
@@ -73,6 +86,19 @@
             0.0625
           ]
         }
+      },
+      "fit_file": "demo_integrals.fits/000002.spfit",
+      "row": {
+        "sequence_index": 2,
+        "spectrum_number": "2",
+        "spectrum_id": "2.npz",
+        "source_path": "C:\\Users\\User\\Documents\\ChatGPT\\spintegrate_ultimatum\\examples\\demo_series\\2.npz",
+        "status": "ok",
+        "warnings": "",
+        "phase_p0_deg": 0.0,
+        "phase_p1_deg": 0.0,
+        "peak_count": 4,
+        "max_relative_rmse": 0.011542899046338715
       }
     },
     {
@@ -109,6 +135,19 @@
             0.0625
           ]
         }
+      },
+      "fit_file": "demo_integrals.fits/000003.spfit",
+      "row": {
+        "sequence_index": 3,
+        "spectrum_number": "3",
+        "spectrum_id": "3.npz",
+        "source_path": "C:\\Users\\User\\Documents\\ChatGPT\\spintegrate_ultimatum\\examples\\demo_series\\3.npz",
+        "status": "ok",
+        "warnings": "",
+        "phase_p0_deg": 0.0,
+        "phase_p1_deg": 0.0,
+        "peak_count": 4,
+        "max_relative_rmse": 0.011506560811395986
       }
     },
     {
@@ -145,6 +184,19 @@
             0.0625
           ]
         }
+      },
+      "fit_file": "demo_integrals.fits/000004.spfit",
+      "row": {
+        "sequence_index": 4,
+        "spectrum_number": "4",
+        "spectrum_id": "4.npz",
+        "source_path": "C:\\Users\\User\\Documents\\ChatGPT\\spintegrate_ultimatum\\examples\\demo_series\\4.npz",
+        "status": "ok",
+        "warnings": "",
+        "phase_p0_deg": 0.0,
+        "phase_p1_deg": 0.0,
+        "peak_count": 4,
+        "max_relative_rmse": 0.012369016950965622
       }
     }
   ]

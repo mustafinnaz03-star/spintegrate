@@ -217,7 +217,8 @@ def test_batch_order_scaling_errors_and_output_recipe(tmp_path):
     with (tmp_path/'integrals.csv').open(encoding='utf-8-sig') as stream:
         csvrows = list(csv.DictReader(stream))
     assert len(csvrows) == 5
-    assert csvrows[-1]['integral__signal'] == 'nan'
+    assert list(csvrows[0]) == ['spectrum_number', 'spectrum_id', 'standard', 'signal']
+    assert csvrows[-1]['signal'] == 'nan'
 
 
 def test_batch_cancel_exports_partial_rows(tmp_path):

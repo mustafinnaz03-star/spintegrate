@@ -130,6 +130,8 @@ class Session:
         intnames = [r.name for r in self.integrals]
         if len(intnames) != len(set(intnames)) or any(not n.strip() for n in intnames):
             raise ValueError('Имена интегралов должны быть уникальны.')
+        if set(intnames) & {'spectrum_number', 'spectrum_id'}:
+            raise ValueError('Имена spectrum_number и spectrum_id зарезервированы для столбцов CSV.')
         parents = {r.name: r for r in self.regions}
         for r in self.integrals:
             parent = parents.get(r.parent)
@@ -148,7 +150,10 @@ class Session:
 
     @classmethod
     def load(cls, path):
-        d = json.loads(Path(path).read_text(encoding='utf-8'))
+        return cls.from_dict(json.loads(Path(path).read_text(encoding='utf-8')))
+
+    @classmethod
+    def from_dict(cls, d):
         if d.get('schema_version') != 1:
             raise ValueError('Неподдерживаемая версия настроек.')
         session = cls(
@@ -541,14 +546,146 @@ def discover_spectra(root, recursive=True):
 
 
 def write_batch_csv(path, rows, session: Session):
-    """UTF-8 BOM for Excel. Failed values are NaN, never fabricated zeroes."""
-    fields = ['sequence_index', 'spectrum_number', 'spectrum_id', 'source_path']
-    fields += [f'integral__{r.name}' for r in session.integrals]
-    fields += ['status', 'warnings', 'phase_p0_deg', 'phase_p1_deg', 'peak_count', 'max_relative_rmse']
+    """One numeric column per named area, with no labels embedded in values."""
+    session.validate()
+    fields = ['spectrum_number', 'spectrum_id'] + [r.name for r in session.integrals]
     with Path(path).open('w', encoding='utf-8-sig', newline='') as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
+        writer = csv.writer(stream)
+        writer.writerow(fields)
+        for row in rows:
+            writer.writerow([row['spectrum_number'], row['spectrum_id']]
+                            + [row[f'integral__{r.name}'] for r in session.integrals])
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def save_analysis(path, analysis: Analysis, session: Session):
+    """Save the actual fitted arrays in a portable, non-pickle .spfit archive."""
+    session.validate(require_regions=True)
+    s = analysis.spectrum
+    metadata = dict(format='spintegrate-fit', version=1, session=asdict(session),
+                    spectrum=dict(sf_mhz=s.sf_mhz, sw_hz=s.sw_hz, source=s.source,
+                                  phases=s.phases, notes=s.notes),
+                    integrals=analysis.integrals, errors=analysis.errors,
+                    status=analysis.status, notes=analysis.notes, regions=[])
+    arrays = dict(spectrum_ppm=s.ppm, spectrum_intensity=s.intensity,
+                  spectrum_complex=s.complex_spectrum)
+    for index, (name, result) in enumerate(analysis.results.items()):
+        key = f'r{index}'
+        metadata['regions'].append(dict(key=key, name=name, success=result.success,
+                                        notes=result.notes, diagnostics=result.diagnostics))
+        for attr in ('x', 'raw', 'baseline', 'corrected', 'centers', 'initial_amplitudes',
+                     'amplitudes', 'widths', 'fitted'):
+            arrays[f'{key}_{attr}'] = getattr(result, attr)
+    arrays['metadata'] = np.array(json.dumps(_json_safe(metadata), ensure_ascii=False, allow_nan=False))
+    # A stream preserves the .spfit suffix (numpy otherwise appends .npz).
+    with Path(path).open('wb') as stream:
+        np.savez_compressed(stream, **arrays)
+
+
+def load_analysis(path):
+    """Return (Analysis, Session) without accessing the original FID or refitting."""
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            metadata = json.loads(str(archive['metadata'].item()))
+            if metadata.get('format') != 'spintegrate-fit' or metadata.get('version') != 1:
+                raise ValueError('Неподдерживаемый формат файла подгонки.')
+            session = Session.from_dict(metadata['session'])
+            session.validate(require_regions=True)
+            def array(key, complex_ok=False):
+                value = np.asarray(archive[key])
+                if (value.ndim != 1 or value.dtype.kind not in ('f', 'i', 'u', 'c')
+                        or (not complex_ok and np.iscomplexobj(value)) or not np.isfinite(value).all()):
+                    raise ValueError(f'Повреждён массив {key} в файле подгонки.')
+                return value.copy()
+            data = metadata['spectrum']
+            ppm, y = array('spectrum_ppm'), array('spectrum_intensity')
+            ft = array('spectrum_complex', complex_ok=True)
+            if len(ppm) < 2 or len(y) != len(ppm) or len(ft) != len(ppm) or not np.all(np.diff(ppm) > 0):
+                raise ValueError('Повреждена шкала спектра в файле подгонки.')
+            spectrum = Spectrum(ppm, y, ft, data['sf_mhz'], data['sw_hz'],
+                                data['source'], tuple(data['phases']), data['notes'])
+            results = {}
+            region_names = {r.name for r in session.regions}
+            for entry in metadata['regions']:
+                key, name = entry['key'], entry['name']
+                if name not in region_names or name in results:
+                    raise ValueError('Неверный список областей в файле подгонки.')
+                attrs = {attr: array(f'{key}_{attr}') for attr in
+                         ('x', 'raw', 'baseline', 'corrected', 'centers', 'initial_amplitudes',
+                          'amplitudes', 'widths', 'fitted')}
+                if (len(attrs['x']) < 8 or not np.all(np.diff(attrs['x']) > 0)
+                        or any(len(attrs[a]) != len(attrs['x']) for a in ('raw', 'baseline', 'corrected', 'fitted'))
+                        or any(len(attrs[a]) != len(attrs['centers']) for a in ('initial_amplitudes', 'amplitudes', 'widths'))
+                        or np.any(attrs['widths'] <= 0)):
+                    raise ValueError(f'Несогласованные массивы области {name}.')
+                results[name] = FitResult(name, **attrs, success=entry['success'],
+                                          notes=entry['notes'], diagnostics=entry['diagnostics'])
+            integrals = {name: float('nan') if v is None else float(v)
+                         for name, v in metadata['integrals'].items()}
+            analysis = Analysis(spectrum, results, integrals, metadata['errors'],
+                                metadata['status'], metadata['notes'])
+            return analysis, session
+    except (KeyError, TypeError, OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f'Не удалось прочитать файл подгонки: {exc}') from exc
+
+
+def load_batch_results(csv_path):
+    """Reopen current or legacy CSV + sidecars; resolve fit files relative to CSV."""
+    csv_path = Path(csv_path).resolve()
+    settings_path = csv_path.with_suffix('.settings.json')
+    if not settings_path.is_file():
+        raise ValueError(f'Для просмотра CSV нужен сохранённый рецепт рядом с ним: {settings_path.name}. '
+                         'Можно также открыть отдельный файл .spfit без CSV и JSON.')
+    session = Session.load(settings_path)
+    session.validate(require_regions=True)
+    report_path = csv_path.with_suffix('.diagnostics.json')
+    report = json.loads(report_path.read_text(encoding='utf-8')) if report_path.exists() else {}
+    details = report.get('spectra', [])
+    by_id = {r['spectrum_id']: r for r in details}
+    rows = []
+    with csv_path.open(encoding='utf-8-sig', newline='') as stream:
+        reader = csv.DictReader(stream)
+        fields = reader.fieldnames or []
+        if not {'spectrum_number', 'spectrum_id'} <= set(fields):
+            raise ValueError('В CSV отсутствуют столбцы spectrum_number / spectrum_id.')
+        legacy = all(f'integral__{r.name}' in fields for r in session.integrals)
+        for number, source in enumerate(reader, 1):
+            extra = by_id.get(source['spectrum_id'], {})
+            row = dict(extra.get('row', {}))
+            # Legacy files contain technical columns directly in the table.
+            technical = {'sequence_index', 'spectrum_number', 'spectrum_id', 'source_path',
+                         'status', 'warnings', 'phase_p0_deg', 'phase_p1_deg', 'peak_count', 'max_relative_rmse'}
+            row.update({k: v for k, v in source.items()
+                        if k in (technical if legacy else {'spectrum_number', 'spectrum_id'})})
+            row.setdefault('sequence_index', number)
+            row.setdefault('status', 'unknown')
+            row.setdefault('warnings', 'Подробная диагностика недоступна.' if not extra else '')
+            row.setdefault('source_path', '')
+            for area in session.integrals:
+                column = f'integral__{area.name}' if legacy else area.name
+                try:
+                    row[f'integral__{area.name}'] = float(source[column])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(f'Неверное значение интеграла «{area.name}» в строке {number}.') from exc
+            fit_file = extra.get('fit_file') or row.get('fit_file', '')
+            row['fit_file'] = str((csv_path.parent / fit_file).resolve()) if fit_file else ''
+            if row['source_path'] and not Path(row['source_path']).is_absolute():
+                candidate = csv_path.parent / row['source_path']
+                if candidate.exists():
+                    row['source_path'] = str(candidate.resolve())
+            rows.append(row)
+    return rows, session
 
 
 def batch_analyze(root, session: Session, csv_path, progress: Callable | None = None,
@@ -561,6 +698,8 @@ def batch_analyze(root, session: Session, csv_path, progress: Callable | None = 
     csv_path = Path(csv_path)
     # Save the exact recipe alongside the table for reproducibility.
     session.save(csv_path.with_suffix('.settings.json'))
+    fit_directory = csv_path.with_suffix('.fits')
+    fit_directory.mkdir(parents=True, exist_ok=True)
     rows, report = [], []
     was_cancelled = False
     for number, path in enumerate(paths, 1):
@@ -569,10 +708,11 @@ def batch_analyze(root, session: Session, csv_path, progress: Callable | None = 
             break
         ident = path.relative_to(root).as_posix()
         row = dict(sequence_index=number, spectrum_number=path.stem if path.is_file() else path.name,
-                   spectrum_id=ident, source_path=str(path),
+                   spectrum_id=ident, source_path=str(path.resolve()), fit_file='',
                    status='error', warnings='', phase_p0_deg='', phase_p1_deg='',
                    peak_count='', max_relative_rmse='')
         row.update({f'integral__{r.name}': float('nan') for r in session.integrals})
+        details = dict(spectrum_id=ident, errors={}, diagnostics={})
         try:
             raw = load_raw(path, session.processing.remove_digital_filter)
             analysis = analyze(process(raw, session.processing), session)
@@ -582,16 +722,27 @@ def batch_analyze(root, session: Session, csv_path, progress: Callable | None = 
                        peak_count=sum(len(r.centers) for r in analysis.results.values()))
             rmses = [r.diagnostics.get('relative_rmse') for r in analysis.results.values()]
             row['max_relative_rmse'] = max((v for v in rmses if v is not None), default='')
-            report.append(dict(spectrum_id=ident, errors=analysis.errors,
-                               diagnostics={n: r.diagnostics for n, r in analysis.results.items()}))
+            details.update(errors=analysis.errors,
+                           diagnostics={n: r.diagnostics for n, r in analysis.results.items()})
+            try:
+                fit_path = fit_directory / f'{number:06d}.spfit'
+                save_analysis(fit_path, analysis, session)
+                row['fit_file'] = str(fit_path.resolve())
+                details['fit_file'] = fit_path.relative_to(csv_path.parent).as_posix()
+            except Exception as exc:
+                if row['status'] == 'ok':
+                    row['status'] = 'warning'
+                row['warnings'] += f' | Не удалось сохранить файл подгонки: {exc}'
         except Exception as exc:
             row['warnings'] = str(exc)
-            report.append(dict(spectrum_id=ident, errors={'spectrum': str(exc)}))
+            details['errors'] = {'spectrum': str(exc)}
+        details['row'] = {k: v for k, v in row.items() if not k.startswith('integral__') and k != 'fit_file'}
+        report.append(details)
         rows.append(row)
         if progress:
             progress(number, len(paths), row)
     write_batch_csv(csv_path, rows, session)
     csv_path.with_suffix('.diagnostics.json').write_text(
-        json.dumps(dict(cancelled=was_cancelled, processed=len(rows), total=len(paths), spectra=report),
-                   ensure_ascii=False, indent=2), encoding='utf-8')
+        json.dumps(_json_safe(dict(cancelled=was_cancelled, processed=len(rows), total=len(paths), spectra=report)),
+                   ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
     return rows, was_cancelled

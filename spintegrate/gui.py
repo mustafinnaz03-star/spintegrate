@@ -18,8 +18,10 @@ from matplotlib.widgets import SpanSelector
 
 from .core import (BASELINE_METHODS, PHASE_MODES, BaselineSettings, FitRegion,
                    IntegrationRegion, Session, analyze, baseline_correct,
-                   batch_analyze, discover_spectra, load_raw, pick_peaks, process)
+                   batch_analyze, discover_spectra, load_analysis, load_batch_results,
+                   load_raw, pick_peaks, process, save_analysis, write_batch_csv)
 from .demo import demo_raw, demo_session, write_demo_series
+from .plotting import draw_spectrum
 
 
 PHASE_LABELS = {'Без коррекции': 'none', 'ACME (nmrglue)': 'acme',
@@ -143,6 +145,8 @@ class SpintegrateApp:
         self.batch_running = False
         self.batch_rows = []
         self.batch_recipe = None
+        self.batch_results_recipe = None
+        self.review_windows = []
         self.preprocess_window = None
         self.status = tk.StringVar(value='Откройте папку эксперимента Bruker или демонстрационный спектр.')
         self._build()
@@ -236,6 +240,7 @@ class SpintegrateApp:
         self.integral_tree.column('integral', width=140)
         self.integral_tree.pack(fill='x', padx=6, pady=8)
         ttk.Button(result_tab, text='Сохранить пики и интегралы CSV…', command=self.export_single).pack(pady=4)
+        ttk.Button(result_tab, text='Сохранить файл подгонки .spfit…', command=self.save_single_fit).pack(pady=4)
         frame, self.result_text = scrolled_text(result_tab, 17)
         frame.pack(fill='both', expand=True, padx=6, pady=8)
         set_text(self.result_text, 'После анализа здесь появятся остаток, ограничения ширин, '
@@ -344,20 +349,32 @@ class SpintegrateApp:
         ttk.Button(buttons, text='Создать демо-серию…', command=self.create_demo_series).pack(side='right', padx=4)
         self.progress = ttk.Progressbar(frame, mode='determinate')
         self.progress.pack(fill='x', pady=4)
-        self.batch_tree = ttk.Treeview(frame, columns=('status', 'integrals'), show='tree headings', height=13)
-        self.batch_tree.heading('#0', text='Номер / ID спектра')
-        self.batch_tree.heading('status', text='Статус')
-        self.batch_tree.heading('integrals', text='Интегралы Σ A × HWHM')
-        self.batch_tree.column('#0', width=280)
-        self.batch_tree.column('status', width=90)
-        self.batch_tree.column('integrals', width=700)
-        self.batch_tree.pack(fill='both', expand=True, pady=8)
+        review_buttons = ttk.Frame(frame)
+        review_buttons.pack(fill='x', pady=(2, 8))
+        ttk.Button(review_buttons, text='Показать фит выбранного спектра', command=self.review_selected_fit).pack(side='left', padx=4)
+        ttk.Button(review_buttons, text='Открыть результаты CSV…', command=self.open_batch_results).pack(side='left', padx=4)
+        ttk.Button(review_buttons, text='Открыть файл подгонки .spfit…', command=self.open_fit_file).pack(side='left', padx=4)
+        table = ttk.Frame(frame)
+        table.pack(fill='both', expand=True, pady=8)
+        table.rowconfigure(0, weight=1)
+        table.columnconfigure(0, weight=1)
+        self.batch_tree = ttk.Treeview(table, show='headings', height=11)
+        vertical = ttk.Scrollbar(table, orient='vertical', command=self.batch_tree.yview)
+        horizontal = ttk.Scrollbar(table, orient='horizontal', command=self.batch_tree.xview)
+        self.batch_tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        self.batch_tree.grid(row=0, column=0, sticky='nsew')
+        vertical.grid(row=0, column=1, sticky='ns')
+        horizontal.grid(row=1, column=0, sticky='ew')
+        self.configure_batch_columns(Session())
         self.batch_tree.bind('<<TreeviewSelect>>', self.show_batch_row)
+        self.batch_tree.bind('<Double-1>', lambda _: self.review_selected_fit())
         block, self.batch_text = scrolled_text(frame, 5)
         block.pack(fill='x')
         set_text(self.batch_text, 'Каждый спектр обрабатывается независимо. Ошибки не останавливают '
                  'серию; недостоверные интегралы записываются как NaN. '
-                 'Рядом с CSV сохраняются JSON настроек и подробная диагностика.')
+                 'CSV: номер спектра и отдельные числовые колонки областей. '
+                 'Для проверки фита выберите строку и нажмите «Показать фит». '
+                 'Рядом сохраняются JSON и папка .fits с файлами .spfit.')
 
     def _sync_widgets(self):
         self.loading_settings = True
@@ -434,9 +451,7 @@ class SpintegrateApp:
                 _, number, total, row = message
                 self.progress.configure(maximum=total, value=number)
                 self.batch_rows.append(row)
-                values = ', '.join(f'{k[10:]}={v:.6g}' for k, v in row.items() if k.startswith('integral__'))
-                self.batch_tree.insert('', 'end', text=f"{number}: {row['spectrum_id']}",
-                                       values=(row['status'], values))
+                self.insert_batch_row(row)
                 self.status.set(f"Серия: {number}/{total}, {row['spectrum_id']} — {row['status']}")
         if self.pending_preview and 'preview' not in self.jobs:
             task = self.pending_preview
@@ -546,57 +561,13 @@ class SpintegrateApp:
         for selector in self.selectors:
             selector.disconnect_events()
         self.selectors.clear()
-        self._draw_empty()
-        if self.spectrum is None:
-            return
-        spectrum = self.spectrum
-        self.overview_ax.plot(spectrum.ppm, spectrum.intensity, color='#254b79', lw=.8)
-        self.overview_ax.set_xlim(spectrum.ppm[-1], spectrum.ppm[0])
-        for r in self.session.regions:
-            self.overview_ax.axvspan(r.low, r.high, color='#4d8bbb', alpha=.17)
-            self.overview_ax.text((r.low+r.high)/2, .95, r.name, transform=self.overview_ax.get_xaxis_transform(),
-                                   ha='center', va='top', fontsize=8)
-        for r in self.session.integrals:
-            self.overview_ax.axvspan(r.low, r.high, color='#2c9874', alpha=.23)
-        result = self.analysis.results.get(self.selected_region) if self.analysis else None
-        region = next((r for r in self.session.regions if r.name == self.selected_region), None)
-        if result:
-            x, y = result.x, result.corrected
-            self.detail_ax.plot(x, y, color='#254b79', lw=1., label='После базовой линии')
-            self.detail_ax.plot(x, result.fitted, color='#d26335', lw=1.4, label='Сумма Лоренцев')
-            # All components are exported; limit drawn curves to keep the UI usable.
-            components = result.components()
-            for i in range(min(len(result.centers), 60)):
-                self.detail_ax.plot(x, components[:, i], '--', lw=.75, alpha=.6)
-            self.detail_ax.scatter(result.centers, result.initial_amplitudes, color='#c33b43',
-                                    s=20, zorder=4, label='Peak-picking (фикс. центры)')
-            self.residual_ax.plot(x, y-result.fitted, color='#687689', lw=.85)
-            self.detail_ax.set_title(f'{result.region}: {len(result.centers)} пиков; '
-                                    + ('сошлось' if result.success else 'НЕ СОШЛОСЬ'), fontsize=10, loc='left')
-        elif local:
-            x, raw, y, line, peaks, _ = local
-            self.detail_ax.plot(x, raw, color='#b0b9c5', lw=.9, label='До базовой линии')
-            self.detail_ax.plot(x, line, color='#d26335', lw=1., label='Базовая линия')
-            self.detail_ax.plot(x, y, color='#254b79', lw=1., label='После коррекции')
-            self.detail_ax.scatter(*peaks, color='#c33b43', s=22, zorder=4, label='Peak-picking')
-            self.detail_ax.axhline(self.session.fit.threshold, color='#c33b43', ls=':', lw=.8, label='Threshold')
-            if self.session.fit.signed:
-                self.detail_ax.axhline(-self.session.fit.threshold, color='#c33b43', ls=':', lw=.8)
-        else:
-            self.detail_ax.plot(spectrum.ppm, spectrum.intensity, color='#254b79', lw=.8, label='Спектр')
-        if region:
-            self.detail_ax.set_xlim(region.high, region.low)
-            for area in self.session.integrals:
-                if area.parent == region.name:
-                    self.detail_ax.axvspan(area.low, area.high, color='#2c9874', alpha=.12)
-        else:
-            self.detail_ax.set_xlim(spectrum.ppm[-1], spectrum.ppm[0])
-        self.detail_ax.legend(fontsize=8, loc='upper right')
-        self.residual_ax.axhline(0, color='#a0a8b5', lw=.7)
-        for ax in (self.overview_ax, self.detail_ax):
-            self.selectors.append(SpanSelector(ax, self.on_span, 'horizontal', useblit=True,
-                                  props=dict(alpha=.25, facecolor='#e6a24a'), button=1,
-                                  interactive=False, minspan=0))
+        draw_spectrum(self.overview_ax, self.detail_ax, self.residual_ax, self.spectrum,
+                      self.session, self.selected_region, self.analysis, local)
+        if self.spectrum is not None:
+            for ax in (self.overview_ax, self.detail_ax):
+                self.selectors.append(SpanSelector(ax, self.on_span, 'horizontal', useblit=True,
+                                      props=dict(alpha=.25, facecolor='#e6a24a'), button=1,
+                                      interactive=False, minspan=0))
         self.canvas.draw_idle()
 
     def on_span(self, low, high):
@@ -851,15 +822,27 @@ class SpintegrateApp:
                                                         result.amplitudes, result.widths), 1):
                         writer.writerow([name, i, c, a0, a, w, 2*w*self.spectrum.sf_mhz, a*w, result.success])
             integral_path = Path(path).with_suffix('.integrals.csv')
-            with integral_path.open('w', encoding='utf-8-sig', newline='') as stream:
-                writer = csv.writer(stream)
-                writer.writerow(['signal', 'integral_A_x_HWHM', 'status'])
-                for name, value in self.analysis.integrals.items():
-                    writer.writerow([name, value, self.analysis.status])
+            source = Path(self.analysis.spectrum.source)
+            row = dict(spectrum_number=source.stem if source.is_file() else source.name,
+                       spectrum_id=source.name)
+            row.update({f'integral__{n}': v for n, v in self.analysis.integrals.items()})
+            write_batch_csv(integral_path, [row], self.session)
             self.session.save(Path(path).with_suffix('.settings.json'))
             self.status.set('Сохранены CSV пиков, CSV интегралов и JSON настроек: ' + path)
         except Exception as exc:
             self.error(str(exc))
+
+    def save_single_fit(self):
+        if self.analysis is None:
+            return self.error('Сначала выполните анализ с текущими параметрами.')
+        path = filedialog.asksaveasfilename(defaultextension='.spfit', initialfile='spectrum.spfit',
+                                          filetypes=[('Подгонка Spintegrate', '*.spfit')])
+        if path:
+            try:
+                save_analysis(path, self.analysis, self.session)
+                self.status.set('Сохранён файл подгонки: ' + path)
+            except Exception as exc:
+                self.error(str(exc))
 
     def choose_batch_root(self):
         path = filedialog.askdirectory(title='Корневая папка серии')
@@ -898,6 +881,8 @@ class SpintegrateApp:
     def run_batch(self):
         if self.batch_running:
             return
+        if 'load_batch_results' in self.jobs:
+            return self.error('Дождитесь загрузки открываемого CSV перед запуском новой серии.')
         if self.batch_recipe is None:
             return self.error('Сначала «Запомнить → серия» или загрузить JSON настроек.')
         try:
@@ -910,15 +895,19 @@ class SpintegrateApp:
             out = Path(self.batch_output.get())
             if out.suffix.lower() != '.csv' or not out.parent.is_dir():
                 raise ValueError('Выберите путь .csv в существующей папке.')
-            outputs = [out, out.with_suffix('.settings.json'), out.with_suffix('.diagnostics.json')]
+            outputs = [out, out.with_suffix('.settings.json'), out.with_suffix('.diagnostics.json'),
+                       out.with_suffix('.fits')]
             if any(p.exists() for p in outputs) and not messagebox.askyesno(
-                    'Заменить результаты?', 'CSV или связанные JSON уже существуют. Заменить их?', parent=self.root):
+                    'Заменить результаты?', 'CSV, JSON или папка .fits уже существуют. '
+                    'Заменить результаты и файлы подгонок с совпадающими номерами?', parent=self.root):
                 return
         except Exception as exc:
             return self.error(str(exc))
         self.batch_running = True
         self.batch_cancel.clear()
         self.batch_rows.clear()
+        self.batch_results_recipe = copy.deepcopy(recipe)
+        self.configure_batch_columns(recipe)
         for item in self.batch_tree.get_children():
             self.batch_tree.delete(item)
         self.progress.configure(value=0, maximum=len(paths))
@@ -933,7 +922,8 @@ class SpintegrateApp:
             self.status.set(f"{'Остановлено' if cancelled else 'Готово'}: {len(rows)} спектров; CSV: {out}")
             set_text(self.batch_text, f'CSV: {out}\nОшибок: {sum(r["status"] == "error" for r in rows)}; '
                      f'предупреждений: {sum(r["status"] == "warning" for r in rows)}.\n'
-                     'Выберите строку таблицы, чтобы прочитать диагностику спектра.')
+                     'Двойной щелчок по строке открывает сохранённую подгонку. '
+                     'Для просмотра после перезапуска используйте «Открыть результаты CSV…».')
         self.submit('batch', lambda: batch_analyze(root, recipe, out, progress,
                            self.batch_cancel.is_set, recursive), finished)
 
@@ -948,7 +938,88 @@ class SpintegrateApp:
             i = self.batch_tree.index(selection[0])
             if i < len(self.batch_rows):
                 row = self.batch_rows[i]
-                set_text(self.batch_text, f"{row['spectrum_id']} — {row['status']}\n{row['warnings']}")
+                set_text(self.batch_text, f"{row['spectrum_id']} — {row['status']}\n{row['warnings']}\n"
+                         f"Файл подгонки: {row.get('fit_file') or 'не сохранён'}")
+
+    def configure_batch_columns(self, recipe):
+        columns = ['number', 'id', 'status'] + [f'area{i}' for i in range(len(recipe.integrals))]
+        self.batch_tree.configure(columns=columns)
+        for key, label, width in [('number', 'Номер спектра', 110), ('id', 'ID спектра', 200),
+                                  ('status', 'Статус', 95)]:
+            self.batch_tree.heading(key, text=label)
+            self.batch_tree.column(key, width=width, minwidth=75, stretch=False)
+        for i, area in enumerate(recipe.integrals):
+            self.batch_tree.heading(f'area{i}', text=area.name)
+            self.batch_tree.column(f'area{i}', width=155, minwidth=100)
+
+    def insert_batch_row(self, row):
+        recipe = self.batch_results_recipe
+        values = [row['spectrum_number'], row['spectrum_id'], row['status']]
+        values.extend(f"{row[f'integral__{r.name}']:.9g}" for r in recipe.integrals)
+        self.batch_tree.insert('', 'end', values=values)
+
+    def open_batch_results(self):
+        if self.batch_running:
+            return self.error('Дождитесь окончания или остановите текущую серию перед открытием другого CSV.')
+        path = filedialog.askopenfilename(title='Открыть CSV вместе с JSON и папкой .fits',
+                                          filetypes=[('Результаты Spintegrate', '*.csv')])
+        if not path:
+            return
+        self.status.set('Чтение результатов серии…')
+        def ready(result):
+            rows, recipe = result
+            self.batch_rows = rows
+            self.batch_results_recipe = recipe
+            self.configure_batch_columns(recipe)
+            for item in self.batch_tree.get_children():
+                self.batch_tree.delete(item)
+            for row in rows:
+                self.insert_batch_row(row)
+            self.progress.configure(maximum=max(1, len(rows)), value=len(rows))
+            self.tabs.select(self.batch_tab)
+            self.status.set(f'Загружено {len(rows)} спектров из {path}. Выберите строку для проверки подгонки.')
+        self.submit('load_batch_results', lambda: load_batch_results(path), ready)
+
+    def open_fit_file(self):
+        path = filedialog.askopenfilename(title='Открыть сохранённую подгонку без повторного расчёта',
+                                          filetypes=[('Подгонка Spintegrate', '*.spfit')])
+        if path:
+            self._open_fit_path(path)
+
+    def _open_fit_path(self, path):
+        self.status.set('Загрузка сохранённой подгонки…')
+        def ready(result):
+            analysis, recipe = result
+            self._show_fit_review(analysis, recipe, f'Сохранённая подгонка: {path}')
+        self.submit('review', lambda: load_analysis(path), ready)
+
+    def review_selected_fit(self):
+        selection = self.batch_tree.selection()
+        if not selection:
+            return self.error('Сначала выберите спектр в таблице серии.')
+        row = self.batch_rows[self.batch_tree.index(selection[0])]
+        fit_file = row.get('fit_file')
+        if fit_file and Path(fit_file).is_file():
+            return self._open_fit_path(fit_file)
+        # Older CSVs did not save fitted arrays. Recalculate only as a clearly
+        # labeled fallback, using that series' recipe rather than current widgets.
+        source = row.get('source_path')
+        recipe = copy.deepcopy(self.batch_results_recipe)
+        if not source or not Path(source).exists() or recipe is None:
+            return self.error('Файл .spfit не найден и исходный спектр недоступен. '
+                              'Откройте сохранённый .spfit или верните исходный FID для старой серии.')
+        self.status.set('Для этой серии нет сохранённого фита. Повторный расчёт по её сохранённым настройкам…')
+        def work():
+            raw = load_raw(source, recipe.processing.remove_digital_filter)
+            return analyze(process(raw, recipe.processing), recipe)
+        def ready(analysis):
+            self._show_fit_review(analysis, recipe, 'ПОВТОРНЫЙ РАСЧЁТ из исходного спектра: ' + source)
+        self.submit('review', work, ready)
+
+    def _show_fit_review(self, analysis, recipe, origin):
+        self.review_windows = [w for w in self.review_windows if w.window.winfo_exists()]
+        self.review_windows.append(FitReviewWindow(self, analysis, recipe, origin))
+        self.status.set('Открыто окно проверки подгонки. Настройки одиночного анализа не изменены.')
 
     def open_preprocess(self):
         if self.preprocess_window and self.preprocess_window.window.winfo_exists():
@@ -964,6 +1035,79 @@ class SpintegrateApp:
             self.batch_cancel.set()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
+
+
+class FitReviewWindow:
+    """Read-only review of actual saved results; never changes live fit settings."""
+    def __init__(self, app, analysis, recipe, origin):
+        self.app, self.analysis = app, analysis
+        self.recipe = copy.deepcopy(recipe)
+        self.origin = origin
+        self.window = tk.Toplevel(app.root)
+        self.window.title('Проверка фита Лоренцами — ' + Path(analysis.spectrum.source).name)
+        self.window.geometry('1170x900')
+        self.window.minsize(950, 700)
+        ttk.Label(self.window, text=origin, wraplength=1100, padding=(10, 6),
+                  foreground='#65758a').pack(fill='x')
+        ttk.Label(self.window, text='Исходный спектр: ' + analysis.spectrum.source,
+                  wraplength=1100, padding=(10, 2)).pack(fill='x')
+        controls = ttk.Frame(self.window, padding=(10, 6))
+        controls.pack(fill='x')
+        ttk.Label(controls, text='Область обработки:').pack(side='left')
+        names = [r.name for r in recipe.regions]
+        self.selected_region = tk.StringVar(value=next(iter(analysis.results), names[0]))
+        selector = ttk.Combobox(controls, textvariable=self.selected_region,
+                                values=names, state='readonly', width=24)
+        selector.pack(side='left', padx=8)
+        selector.bind('<<ComboboxSelected>>', lambda _: self.draw())
+        ttk.Button(controls, text='Сохранить картинку PNG…', command=self.save_image).pack(side='right', padx=4)
+        self.figure = Figure(figsize=(10, 6), dpi=100, facecolor='white')
+        grid = self.figure.add_gridspec(3, 1, height_ratios=(1, 2, .65), hspace=.4)
+        self.overview_ax = self.figure.add_subplot(grid[0])
+        self.detail_ax = self.figure.add_subplot(grid[1])
+        self.residual_ax = self.figure.add_subplot(grid[2], sharex=self.detail_ax)
+        self.figure.subplots_adjust(left=.09, right=.98, top=.95, bottom=.08)
+        plot_frame = ttk.Frame(self.window)
+        plot_frame.pack(fill='both', expand=True)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill='both', expand=True)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, plot_frame)
+        self.toolbar.update()
+        block, self.details = scrolled_text(self.window, 7)
+        block.pack(fill='x', padx=8, pady=6)
+        self.draw()
+
+    def draw(self):
+        name = self.selected_region.get()
+        draw_spectrum(self.overview_ax, self.detail_ax, self.residual_ax,
+                      self.analysis.spectrum, self.recipe, name, self.analysis, component_limit=None)
+        lines = [self.origin, 'Статус спектра: ' + self.analysis.status]
+        for area in self.recipe.integrals:
+            if area.parent == name:
+                value = self.analysis.integrals.get(area.name, float('nan'))
+                lines.append(f'Интеграл {area.name}: {value:.9g} (Σ A × HWHM)')
+        result = self.analysis.results.get(name)
+        if result:
+            d = result.diagnostics
+            lines.append(f"RMSE: {d.get('relative_rmse')}; сошлось: {result.success}; nfev: {d.get('nfev')}")
+            lines.append(' №       ppm (фикс.)       A            HWHM ppm        A×HWHM')
+            for i, (c, a, w) in enumerate(zip(result.centers, result.amplitudes, result.widths), 1):
+                lines.append(f'{i:3}  {c:14.7f} {a:14.6g} {w:14.6g} {a*w:14.6g}')
+        if name in self.analysis.errors:
+            lines.append('ОШИБКА: ' + self.analysis.errors[name])
+        lines.extend(self.analysis.notes)
+        set_text(self.details, '\n'.join(lines))
+        self.canvas.draw_idle()
+
+    def save_image(self):
+        path = filedialog.asksaveasfilename(parent=self.window, defaultextension='.png',
+                   initialfile='lorentzian_fit.png', filetypes=[('Изображение PNG', '*.png')])
+        if path:
+            try:
+                self.figure.savefig(path, dpi=160, bbox_inches='tight')
+                self.app.status.set('Картинка подгонки сохранена: ' + path)
+            except Exception as exc:
+                self.app.error(str(exc))
 
 
 class PreprocessWindow:
