@@ -9,7 +9,7 @@ import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -22,6 +22,9 @@ from .core import (BASELINE_METHODS, PHASE_MODES, BaselineSettings, FitRegion,
                    load_raw, pick_peaks, process, save_analysis, write_batch_csv)
 from .demo import demo_raw, demo_session, write_demo_series
 from .plotting import draw_spectrum
+from .appearance import AREA_COLORS, AppearanceSettings, area_color, validate_appearance
+from .figure_export import render_fit_figure, save_figure
+from .i18n import TranslatedVar, canonical, set_label, tr, translate_widgets, widget_language
 
 
 PHASE_LABELS = {'Без коррекции': 'none', 'ACME (nmrglue)': 'acme',
@@ -34,7 +37,7 @@ class FieldPanel(ttk.Frame):
     """Compact labeled input rows with typed values and a single edit callback."""
     def __init__(self, parent, callback=None):
         super().__init__(parent, padding=8)
-        self.vars, self.types = {}, {}
+        self.vars, self.types, self.choice_widgets = {}, {}, {}
         self.callback = callback
         self.columnconfigure(1, weight=1)
 
@@ -46,6 +49,7 @@ class FieldPanel(ttk.Frame):
             widget = ttk.Checkbutton(self, variable=var)
         elif choices:
             widget = ttk.Combobox(self, textvariable=var, values=choices, state='readonly', width=20)
+            self.choice_widgets[key] = (widget, tuple(choices))
         else:
             widget = ttk.Entry(self, textvariable=var, width=16)
         widget.grid(row=row, column=1, sticky='ew', pady=3)
@@ -69,7 +73,18 @@ class FieldPanel(ttk.Frame):
     def set_values(self, values):
         for k, var in self.vars.items():
             if k in values:
-                var.set(values[k])
+                value = values[k]
+                if k in self.choice_widgets:
+                    value = tr(value, widget_language(self))
+                var.set(value)
+
+    def translate_choices(self, language):
+        for key, (widget, choices) in self.choice_widgets.items():
+            value = canonical(self.vars[key].get())
+            widget.configure(values=[tr(v, language) for v in choices])
+            translated = tr(value, language)
+            if translated != self.vars[key].get():
+                self.vars[key].set(translated)
 
 
 def scrolled_text(parent, height=8):
@@ -84,9 +99,10 @@ def scrolled_text(parent, height=8):
 
 
 def set_text(widget, value):
+    widget._source_text = str(value)
     widget.configure(state='normal')
     widget.delete('1.0', 'end')
-    widget.insert('1.0', value)
+    widget.insert('1.0', tr(value, widget_language(widget)))
     widget.configure(state='disabled')
 
 
@@ -120,6 +136,8 @@ class ScrollPanel(ttk.Frame):
 class SpintegrateApp:
     def __init__(self, root: tk.Tk):
         self.root = root
+        self.language = 'ru'
+        root._spintegrate_language = self.language
         root.title('Spintegrate — анализ спектров ЯМР')
         root.geometry('1400x920')
         root.minsize(1080, 750)
@@ -147,10 +165,13 @@ class SpintegrateApp:
         self.batch_recipe = None
         self.batch_results_recipe = None
         self.review_windows = []
+        self.export_windows = []
+        self.preview_local = None
         self.preprocess_window = None
-        self.status = tk.StringVar(value='Откройте папку эксперимента Bruker или демонстрационный спектр.')
+        self.status = TranslatedVar(root, value='Откройте папку эксперимента Bruker или демонстрационный спектр.')
         self._build()
         self._sync_widgets()
+        self.set_language(self.language)
         root.after(80, self._poll)
         root.protocol('WM_DELETE_WINDOW', self.close)
 
@@ -160,6 +181,13 @@ class SpintegrateApp:
         ttk.Label(top, text='Spintegrate', font=('Segoe UI', 18, 'bold')).pack(side='left')
         ttk.Button(top, text='Загрузить настройки JSON', command=self.load_settings).pack(side='right', padx=4)
         ttk.Button(top, text='Сохранить настройки JSON', command=self.save_settings).pack(side='right', padx=4)
+        self.language_var = tk.StringVar(value='Русский')
+        language_combo = ttk.Combobox(top, textvariable=self.language_var, values=('Русский', 'English'),
+                                      state='readonly', width=10)
+        language_combo.pack(side='right', padx=8)
+        language_combo.bind('<<ComboboxSelected>>', lambda _: self.set_language(
+                            'en' if self.language_var.get() == 'English' else 'ru'))
+        ttk.Label(top, text='Язык / Language').pack(side='right')
         self.tabs = ttk.Notebook(self.root)
         self.tabs.pack(fill='both', expand=True, padx=10)
         self.single_tab, self.batch_tab = ttk.Frame(self.tabs), ttk.Frame(self.tabs)
@@ -173,7 +201,10 @@ class SpintegrateApp:
         ttk.Button(source, text='Аподизация / базовая линия…', command=self.open_preprocess).pack(side='left', padx=8)
         self.fit_button = ttk.Button(source, text='Выполнить анализ', command=self.run_analysis)
         self.fit_button.pack(side='left', padx=4)
-        ttk.Button(source, text='Запомнить → серия', command=self.remember_for_batch).pack(side='right', padx=4)
+        actions = ttk.Frame(self.single_tab, padding=(8, 0, 8, 6))
+        actions.pack(fill='x')
+        ttk.Button(actions, text='Экспорт картинки…', command=self.export_single_image).pack(side='left', padx=4)
+        ttk.Button(actions, text='Запомнить → серия', command=self.remember_for_batch).pack(side='right', padx=4)
         self.source_label = ttk.Label(self.single_tab, text='Спектр не загружен', foreground='#65758a')
         self.source_label.pack(fill='x', padx=12, pady=(0, 6))
         split = ttk.Panedwindow(self.single_tab, orient='horizontal')
@@ -287,6 +318,12 @@ class SpintegrateApp:
         ttk.Label(form, text='Обработка для интеграла').grid(row=2, column=0, sticky='w')
         self.parent_combo = ttk.Combobox(form, textvariable=self.parent_region, state='readonly', width=17)
         self.parent_combo.grid(row=2, column=1, columnspan=2, sticky='ew')
+        self.integration_color = tk.StringVar(value=AREA_COLORS[0])
+        ttk.Label(form, text='Цвет интегрирования').grid(row=3, column=0, sticky='w', pady=6)
+        self.color_swatch = tk.Label(form, textvariable=self.integration_color,
+                                     background=self.integration_color.get(), width=10)
+        self.color_swatch.grid(row=3, column=1, sticky='ew', padx=3)
+        ttk.Button(form, text='Цвет области…', command=self.choose_integration_color).grid(row=3, column=2, sticky='ew')
         buttons = ttk.Frame(parent)
         buttons.pack(fill='x', padx=8)
         ttk.Button(buttons, text='Сохранить область', command=self.add_region).pack(side='left', padx=2)
@@ -385,12 +422,60 @@ class SpintegrateApp:
         self.fit_fields.set_values(asdict(self.session.fit))
         self.loading_settings = False
         self.refresh_regions()
+        if self.language != self.session.appearance.language:
+            self.set_language(self.session.appearance.language)
+
+    def t(self, text):
+        return tr(text, self.language)
+
+    def set_language(self, language):
+        if language not in ('ru', 'en'):
+            raise ValueError('Unsupported language')
+        self.language = language
+        self.root._spintegrate_language = language
+        self.session.appearance.language = language
+        self.language_var.set('English' if language == 'en' else 'Русский')
+        previous = self.loading_settings
+        self.loading_settings = True
+        popup = self.preprocess_window
+        was_loading = popup.loading if popup else None
+        if popup:
+            popup.loading = True
+        try:
+            translate_widgets(self.root, language)
+        finally:
+            self.loading_settings = previous
+            if popup:
+                popup.loading = was_loading
+        self.status.refresh()
+        self.draw(local=self.preview_local)
+        for window in self.review_windows:
+            if window.window.winfo_exists():
+                window.draw()
+        for window in self.export_windows:
+            if window.window.winfo_exists():
+                window.update_info()
+        if popup and popup.window.winfo_exists():
+            popup.status.refresh()
+            if popup.cached_result is not None:
+                popup.draw_cached()
+
+    def dialog(self, function, **options):
+        options.setdefault('parent', self.root)
+        if 'title' in options:
+            options['title'] = self.t(options['title'])
+        if 'filetypes' in options:
+            options['filetypes'] = [(self.t(label), pattern) for label, pattern in options['filetypes']]
+        return function(**options)
+
+    def confirm(self, title, message):
+        return messagebox.askyesno(self.t(title), self.t(message), parent=self.root)
 
     def read_settings(self):
         s = copy.deepcopy(self.session)
         p = self.processing_fields.values()
-        p['phase'] = PHASE_LABELS[p.pop('phase_label')]
-        p['reference_mode'] = REF_LABELS[p.pop('reference_label')]
+        p['phase'] = PHASE_LABELS[canonical(p.pop('phase_label'))]
+        p['reference_mode'] = REF_LABELS[canonical(p.pop('reference_label'))]
         for k, v in p.items():
             setattr(s.processing, k, v)
         for k, v in self.fit_fields.values().items():
@@ -401,6 +486,7 @@ class SpintegrateApp:
     def invalidate(self):
         self.generation += 1
         self.analysis = None
+        self.preview_local = None
         self.fit_button.configure(state='normal')
         for item in self.integral_tree.get_children():
             self.integral_tree.delete(item)
@@ -461,15 +547,15 @@ class SpintegrateApp:
 
     def error(self, text):
         self.status.set('Ошибка: ' + text)
-        messagebox.showerror('Spintegrate', text, parent=self.root)
+        messagebox.showerror('Spintegrate', self.t(text), parent=self.root)
 
     def open_bruker(self):
-        path = filedialog.askdirectory(title='Папка эксперимента с fid и acqus')
+        path = self.dialog(filedialog.askdirectory, title='Папка эксперимента с fid и acqus')
         if path:
             self.load_path(path)
 
     def open_npz(self):
-        path = filedialog.askopenfilename(filetypes=[('FID NPZ', '*.npz')])
+        path = self.dialog(filedialog.askopenfilename, filetypes=[('FID NPZ', '*.npz')])
         if path:
             self.load_path(path)
 
@@ -487,17 +573,19 @@ class SpintegrateApp:
         def loaded(raw):
             self.raw = raw
             self.loaded_filter = remove_filter
-            self.source_label.configure(text=raw.source)
+            set_label(self.source_label, raw.source)
             self.preview()
         self.submit('load', lambda: load_raw(path, remove_filter), loaded, self.generation)
 
     def load_demo(self):
+        appearance = copy.deepcopy(self.session.appearance)
         self.session = demo_session()
+        self.session.appearance = appearance
         self._sync_widgets()
         self.invalidate()
         self.raw = demo_raw()
         self.source_path = None
-        self.source_label.configure(text=self.raw.source)
+        set_label(self.source_label, self.raw.source)
         self.selected_region = self.session.regions[0].name
         self.region_tree.selection_set(self.selected_region)
         self.preview()
@@ -539,6 +627,7 @@ class SpintegrateApp:
             self.session.processing = recipe.processing
             self.session.fit = recipe.fit
             self.spectrum, local = result
+            self.preview_local = local
             self.draw(local=local)
             self.status.set(f'Спектр готов. LB={recipe.processing.lb_hz:g} Гц; '
                             f'P0/P1={self.spectrum.phases[0]:.2f}/{self.spectrum.phases[1]:.2f}°. '
@@ -562,7 +651,7 @@ class SpintegrateApp:
             selector.disconnect_events()
         self.selectors.clear()
         draw_spectrum(self.overview_ax, self.detail_ax, self.residual_ax, self.spectrum,
-                      self.session, self.selected_region, self.analysis, local)
+                      self.session, self.selected_region, self.analysis, local, language=self.language)
         if self.spectrum is not None:
             for ax in (self.overview_ax, self.detail_ax):
                 self.selectors.append(SpanSelector(ax, self.on_span, 'horizontal', useblit=True,
@@ -575,8 +664,8 @@ class SpintegrateApp:
             return
         self.bound_low.set(f'{min(low, high):.6f}')
         self.bound_high.set(f'{max(low, high):.6f}')
-        self.selection_label.configure(text=f'Выбрано {min(low, high):.6f}…{max(low, high):.6f} ppm. '
-                                      'Нажмите «Сохранить область».')
+        set_label(self.selection_label, f'Выбрано {min(low, high):.6f}…{max(low, high):.6f} ppm. '
+                                       'Нажмите «Сохранить область».')
         self.control_tabs.select(1)
 
     def refresh_regions(self):
@@ -605,7 +694,20 @@ class SpintegrateApp:
         name = self.region_name.get().strip()
         if self.selection_mode.get() == 'fit':
             return FitRegion(name, low, high, copy.deepcopy(self.session.baseline_default))
-        return IntegrationRegion(name, self.parent_region.get(), low, high)
+        return IntegrationRegion(name, self.parent_region.get(), low, high, self.integration_color.get())
+
+    def choose_integration_color(self):
+        _, color = colorchooser.askcolor(color=self.integration_color.get(),
+                                         title=self.t('Цвет интегрирования'), parent=self.root)
+        if not color:
+            return
+        self.integration_color.set(color)
+        self.color_swatch.configure(background=color)
+        selection = self.area_tree.selection()
+        if self.selection_mode.get() == 'integral' and selection and selection[0] == self.region_name.get():
+            area = next(r for r in self.session.integrals if r.name == selection[0])
+            area.color = color
+            self.draw(local=self.preview_local)
 
     def add_region(self):
         try:
@@ -619,6 +721,8 @@ class SpintegrateApp:
             if isinstance(region, FitRegion):
                 self.selected_region = region.name
             self.region_name.set(('region_' if isinstance(region, FitRegion) else 'signal_') + str(len(target)+1))
+            self.integration_color.set(AREA_COLORS[len(s.integrals) % len(AREA_COLORS)])
+            self.color_swatch.configure(background=self.integration_color.get())
             self.refresh_regions()
             self.invalidate()
             self.preview()
@@ -685,6 +789,8 @@ class SpintegrateApp:
         self.bound_low.set(str(r.low))
         self.bound_high.set(str(r.high))
         self.selected_region = r.parent
+        self.integration_color.set(area_color(r, self.session.integrals.index(r)))
+        self.color_swatch.configure(background=self.integration_color.get())
         if self.analysis:
             self.draw()
         else:
@@ -696,8 +802,8 @@ class SpintegrateApp:
             return
         name = selection[0]
         dependent = [r for r in self.session.integrals if r.parent == name]
-        if dependent and not messagebox.askyesno('Удалить область',
-                    f'Также удалить {len(dependent)} связанных областей интегрирования?', parent=self.root):
+        if dependent and not self.confirm('Удалить область',
+                    f'Также удалить {len(dependent)} связанных областей интегрирования?'):
             return
         self.session.regions = [r for r in self.session.regions if r.name != name]
         self.session.integrals = [r for r in self.session.integrals if r.parent != name]
@@ -763,7 +869,7 @@ class SpintegrateApp:
             recipe = self.read_settings()
         except ValueError as exc:
             return self.error(str(exc))
-        path = filedialog.asksaveasfilename(defaultextension='.json',
+        path = self.dialog(filedialog.asksaveasfilename, defaultextension='.json',
                     initialfile='spintegrate.settings.json', filetypes=[('Настройки JSON', '*.json')])
         if path:
             try:
@@ -774,7 +880,7 @@ class SpintegrateApp:
                 self.error(str(exc))
 
     def load_settings(self):
-        path = filedialog.askopenfilename(filetypes=[('Настройки JSON', '*.json')])
+        path = self.dialog(filedialog.askopenfilename, filetypes=[('Настройки JSON', '*.json')])
         if not path:
             return
         try:
@@ -801,7 +907,7 @@ class SpintegrateApp:
 
     def _recipe_description(self):
         s = self.batch_recipe
-        self.recipe_label.configure(text=f'Запомнено: {len(s.regions)} областей обработки, '
+        set_label(self.recipe_label, f'Запомнено: {len(s.regions)} областей обработки, '
                  f'{len(s.integrals)} интегралов; фаза={s.processing.phase}; '
                  f'LB={s.processing.lb_hz:g} Гц; threshold={s.fit.threshold:g}. '
                  'Центры и амплитуды определяются заново в каждом спектре.')
@@ -809,7 +915,7 @@ class SpintegrateApp:
     def export_single(self):
         if self.analysis is None:
             return self.error('Сначала выполните анализ с текущими параметрами.')
-        path = filedialog.asksaveasfilename(defaultextension='.csv', initialfile='spectrum.peaks.csv')
+        path = self.dialog(filedialog.asksaveasfilename, defaultextension='.csv', initialfile='spectrum.peaks.csv')
         if not path:
             return
         try:
@@ -835,7 +941,7 @@ class SpintegrateApp:
     def save_single_fit(self):
         if self.analysis is None:
             return self.error('Сначала выполните анализ с текущими параметрами.')
-        path = filedialog.asksaveasfilename(defaultextension='.spfit', initialfile='spectrum.spfit',
+        path = self.dialog(filedialog.asksaveasfilename, defaultextension='.spfit', initialfile='spectrum.spfit',
                                           filetypes=[('Подгонка Spintegrate', '*.spfit')])
         if path:
             try:
@@ -845,12 +951,12 @@ class SpintegrateApp:
                 self.error(str(exc))
 
     def choose_batch_root(self):
-        path = filedialog.askdirectory(title='Корневая папка серии')
+        path = self.dialog(filedialog.askdirectory, title='Корневая папка серии')
         if path:
             self.batch_root.set(path)
 
     def choose_batch_output(self):
-        path = filedialog.asksaveasfilename(defaultextension='.csv', initialfile='integrals.csv',
+        path = self.dialog(filedialog.asksaveasfilename, defaultextension='.csv', initialfile='integrals.csv',
                                           filetypes=[('CSV', '*.csv')])
         if path:
             self.batch_output.set(path)
@@ -863,7 +969,7 @@ class SpintegrateApp:
             self.error(str(exc))
 
     def create_demo_series(self):
-        directory = filedialog.askdirectory(title='Папка для синтетической демо-серии')
+        directory = self.dialog(filedialog.askdirectory, title='Папка для синтетической демо-серии')
         if directory:
             try:
                 target = Path(directory) / 'spintegrate_demo'
@@ -897,9 +1003,9 @@ class SpintegrateApp:
                 raise ValueError('Выберите путь .csv в существующей папке.')
             outputs = [out, out.with_suffix('.settings.json'), out.with_suffix('.diagnostics.json'),
                        out.with_suffix('.fits')]
-            if any(p.exists() for p in outputs) and not messagebox.askyesno(
+            if any(p.exists() for p in outputs) and not self.confirm(
                     'Заменить результаты?', 'CSV, JSON или папка .fits уже существуют. '
-                    'Заменить результаты и файлы подгонок с совпадающими номерами?', parent=self.root):
+                    'Заменить результаты и файлы подгонок с совпадающими номерами?'):
                 return
         except Exception as exc:
             return self.error(str(exc))
@@ -951,6 +1057,7 @@ class SpintegrateApp:
         for i, area in enumerate(recipe.integrals):
             self.batch_tree.heading(f'area{i}', text=area.name)
             self.batch_tree.column(f'area{i}', width=155, minwidth=100)
+        translate_widgets(self.batch_tree, self.language)
 
     def insert_batch_row(self, row):
         recipe = self.batch_results_recipe
@@ -961,7 +1068,7 @@ class SpintegrateApp:
     def open_batch_results(self):
         if self.batch_running:
             return self.error('Дождитесь окончания или остановите текущую серию перед открытием другого CSV.')
-        path = filedialog.askopenfilename(title='Открыть CSV вместе с JSON и папкой .fits',
+        path = self.dialog(filedialog.askopenfilename, title='Открыть CSV вместе с JSON и папкой .fits',
                                           filetypes=[('Результаты Spintegrate', '*.csv')])
         if not path:
             return
@@ -981,7 +1088,7 @@ class SpintegrateApp:
         self.submit('load_batch_results', lambda: load_batch_results(path), ready)
 
     def open_fit_file(self):
-        path = filedialog.askopenfilename(title='Открыть сохранённую подгонку без повторного расчёта',
+        path = self.dialog(filedialog.askopenfilename, title='Открыть сохранённую подгонку без повторного расчёта',
                                           filetypes=[('Подгонка Spintegrate', '*.spfit')])
         if path:
             self._open_fit_path(path)
@@ -1021,6 +1128,17 @@ class SpintegrateApp:
         self.review_windows.append(FitReviewWindow(self, analysis, recipe, origin))
         self.status.set('Открыто окно проверки подгонки. Настройки одиночного анализа не изменены.')
 
+    def export_single_image(self):
+        if self.analysis is None:
+            return self.error('Сначала выполните анализ с текущими параметрами.')
+        self.open_image_export(self.analysis, self.session, self.selected_region)
+
+    def open_image_export(self, analysis, recipe, region):
+        self.export_windows = [w for w in self.export_windows if w.window.winfo_exists()]
+        window = ImageExportWindow(self, analysis, recipe, region)
+        self.export_windows.append(window)
+        return window
+
     def open_preprocess(self):
         if self.preprocess_window and self.preprocess_window.window.winfo_exists():
             self.preprocess_window.window.lift()
@@ -1029,8 +1147,8 @@ class SpintegrateApp:
 
     def close(self):
         if self.batch_running:
-            if not messagebox.askyesno('Закрыть Spintegrate',
-                    'Серия выполняется. Остановить после текущего спектра и закрыть окно?', parent=self.root):
+            if not self.confirm('Закрыть Spintegrate',
+                    'Серия выполняется. Остановить после текущего спектра и закрыть окно?'):
                 return
             self.batch_cancel.set()
         self.executor.shutdown(wait=False, cancel_futures=True)
@@ -1060,7 +1178,11 @@ class FitReviewWindow:
                                 values=names, state='readonly', width=24)
         selector.pack(side='left', padx=8)
         selector.bind('<<ComboboxSelected>>', lambda _: self.draw())
-        ttk.Button(controls, text='Сохранить картинку PNG…', command=self.save_image).pack(side='right', padx=4)
+        self.color_area = tk.StringVar()
+        self.color_combo = ttk.Combobox(controls, textvariable=self.color_area, state='readonly', width=18)
+        self.color_combo.pack(side='left', padx=4)
+        ttk.Button(controls, text='Цвет области…', command=self.choose_color).pack(side='left', padx=4)
+        ttk.Button(controls, text='Экспорт картинки…', command=self.save_image).pack(side='right', padx=4)
         self.figure = Figure(figsize=(10, 6), dpi=100, facecolor='white')
         grid = self.figure.add_gridspec(3, 1, height_ratios=(1, 2, .65), hspace=.4)
         self.overview_ax = self.figure.add_subplot(grid[0])
@@ -1076,11 +1198,17 @@ class FitReviewWindow:
         block, self.details = scrolled_text(self.window, 7)
         block.pack(fill='x', padx=8, pady=6)
         self.draw()
+        translate_widgets(self.window, app.language)
 
     def draw(self):
         name = self.selected_region.get()
+        areas = [area.name for area in self.recipe.integrals if area.parent == name]
+        self.color_combo.configure(values=areas)
+        if self.color_area.get() not in areas:
+            self.color_area.set(areas[0] if areas else '')
         draw_spectrum(self.overview_ax, self.detail_ax, self.residual_ax,
-                      self.analysis.spectrum, self.recipe, name, self.analysis, component_limit=None)
+                      self.analysis.spectrum, self.recipe, name, self.analysis, component_limit=None,
+                      language=self.app.language)
         lines = [self.origin, 'Статус спектра: ' + self.analysis.status]
         for area in self.recipe.integrals:
             if area.parent == name:
@@ -1099,15 +1227,100 @@ class FitReviewWindow:
         set_text(self.details, '\n'.join(lines))
         self.canvas.draw_idle()
 
+    def choose_color(self):
+        area = next((r for r in self.recipe.integrals if r.name == self.color_area.get()), None)
+        if area is None:
+            return
+        _, color = colorchooser.askcolor(color=area_color(area, self.recipe.integrals.index(area)),
+                                         title=self.app.t('Цвет интегрирования'), parent=self.window)
+        if color:
+            area.color = color
+            self.draw()
+
     def save_image(self):
-        path = filedialog.asksaveasfilename(parent=self.window, defaultextension='.png',
-                   initialfile='lorentzian_fit.png', filetypes=[('Изображение PNG', '*.png')])
-        if path:
-            try:
-                self.figure.savefig(path, dpi=160, bbox_inches='tight')
-                self.app.status.set('Картинка подгонки сохранена: ' + path)
-            except Exception as exc:
-                self.app.error(str(exc))
+        return self.app.open_image_export(self.analysis, self.recipe, self.selected_region.get())
+
+
+class ImageExportWindow:
+    def __init__(self, app, analysis, recipe, region):
+        self.app, self.analysis = app, analysis
+        self.recipe = copy.deepcopy(recipe)
+        self.region = region or next(iter(analysis.results), recipe.regions[0].name)
+        self.window = tk.Toplevel(app.root)
+        self.window.title('Экспорт рисунка')
+        self.window.geometry('480x570')
+        self.window.resizable(False, False)
+        self.fields = FieldPanel(self.window, self.update_info)
+        self.fields.pack(fill='x')
+        a = app.session.appearance
+        add = self.fields.add
+        self.language_choices = {'Как в программе': 'auto', 'Русский': 'ru', 'English': 'en'}
+        self.layout_choices = {'Весь спектр + область + остаток': 'full', 'Область + остаток': 'fit', 'Только область': 'region'}
+        add('export_format', 'Формат', a.export_format, ('png', 'tiff', 'svg'), str)
+        add('export_dpi', 'Качество, DPI', a.export_dpi, kind=int,
+            hint='150 / 300 / 600 / 1200 DPI')
+        add('export_width_mm', 'Ширина, мм', a.export_width_mm)
+        add('export_height_mm', 'Высота, мм', a.export_height_mm)
+        add('language_label', 'Язык рисунка', next(k for k, v in self.language_choices.items() if v == a.export_language),
+            tuple(self.language_choices), str)
+        add('layout_label', 'Компоновка', next(k for k, v in self.layout_choices.items() if v == a.export_layout),
+            tuple(self.layout_choices), str)
+        add('export_region_names', 'Названия областей на рисунке', a.export_region_names, kind=bool)
+        add('title', 'Заголовок (необязательно)', '', kind=str)
+        self.info = TranslatedVar(self.window)
+        ttk.Label(self.window, textvariable=self.info, padding=8, wraplength=450).pack(fill='x')
+        ttk.Label(self.window, text='SVG — векторный формат; DPI влияет на PNG и TIFF.',
+                  padding=8, wraplength=450).pack(fill='x')
+        buttons = ttk.Frame(self.window, padding=8)
+        buttons.pack(fill='x')
+        ttk.Button(buttons, text='Сохранить рисунок…', command=self.save).pack(side='left')
+        ttk.Button(buttons, text='Отмена', command=self.window.destroy).pack(side='right')
+        translate_widgets(self.window, app.language)
+        self.update_info()
+
+    def options(self):
+        values = self.fields.values()
+        title = values.pop('title')
+        values['export_language'] = self.language_choices[canonical(values.pop('language_label'))]
+        values['export_layout'] = self.layout_choices[canonical(values.pop('layout_label'))]
+        options = AppearanceSettings(**{**asdict(self.app.session.appearance), **values})
+        validate_appearance(options)
+        return options, title
+
+    def update_info(self):
+        if not hasattr(self, 'info'):
+            return
+        try:
+            a, _ = self.options()
+            if a.export_format == 'svg':
+                text = f'Размер: {a.export_width_mm:g} × {a.export_height_mm:g} мм (вектор)'
+            else:
+                w, h = round(a.export_width_mm/25.4*a.export_dpi), round(a.export_height_mm/25.4*a.export_dpi)
+                text = f'Размер: {w} × {h} пикселей'
+            self.info.set(text)
+        except (ValueError, KeyError) as exc:
+            self.info.set(str(exc))
+
+    def save(self):
+        try:
+            options, title = self.options()
+        except (ValueError, KeyError) as exc:
+            self.info.set(str(exc))
+            return
+        suffix = '.'+options.export_format
+        path = self.app.dialog(filedialog.asksaveasfilename, parent=self.window,
+                  defaultextension=suffix, initialfile='lorentzian_fit'+suffix,
+                  filetypes=[(options.export_format.upper(), '*'+suffix)])
+        if not path:
+            return
+        try:
+            figure = render_fit_figure(self.analysis, self.recipe, self.region, options, self.app.language, title)
+            save_figure(path, figure, options)
+            self.app.session.appearance = options
+            self.app.status.set('Рисунок сохранён: ' + path)
+            self.window.destroy()
+        except Exception as exc:
+            self.app.error(str(exc))
 
 
 class PreprocessWindow:
@@ -1123,6 +1336,10 @@ class PreprocessWindow:
         self.pending = None
         self.preview_key = None
         self.requested_key = None
+        self.cached_result = None
+        self.cached_region = None
+        self.cached_baseline = None
+        self.cached_lb = 0.
         split = ttk.Panedwindow(self.window, orient='horizontal')
         split.pack(fill='both', expand=True)
         left, right = ttk.Frame(split, padding=10), ttk.Frame(split)
@@ -1167,11 +1384,12 @@ class PreprocessWindow:
         self.canvas = FigureCanvasTkAgg(self.figure, master=right)
         self.canvas.get_tk_widget().pack(fill='both', expand=True)
         NavigationToolbar2Tk(self.canvas, right)
-        self.status = tk.StringVar(value='Выберите сохранённую область в главном окне.')
+        self.status = TranslatedVar(self.window, value='Выберите сохранённую область в главном окне.')
         ttk.Label(self.window, textvariable=self.status, wraplength=1100, padding=8).pack(fill='x')
         self.lb_var.trace_add('write', lambda *_: self.changed())
         self.loading = False
         self.window.protocol('WM_DELETE_WINDOW', self.close)
+        translate_widgets(self.window, app.language)
         self.refresh()
 
     def slider_changed(self, value):
@@ -1215,7 +1433,7 @@ class PreprocessWindow:
             self.app.invalidate()
             self.app.schedule_preview()
         r = next((r for r in recipe.regions if r.name == self.app.selected_region), None)
-        self.region_label.configure(text=f'{r.name}: {r.low:g}…{r.high:g} ppm' if r else 'Сначала сохраните область обработки.')
+        set_label(self.region_label, f'{r.name}: {r.low:g}…{r.high:g} ppm' if r else 'Сначала сохраните область обработки.')
         if self.app.raw is None:
             return
         key = (id(self.app.raw), repr(recipe.processing), repr(b), repr(r), self.app.generation)
@@ -1248,36 +1466,43 @@ class PreprocessWindow:
                 return
             current, reference, local = result
             self.preview_key = key
-            self.ax_apod.clear()
-            self.ax_base.clear()
-            # Compare at the same ppm coordinates, including independently applied reference rules.
-            ref_mask = (reference.ppm >= r.low) & (reference.ppm <= r.high) if r else slice(None)
-            cur_mask = (current.ppm >= r.low) & (current.ppm <= r.high) if r else slice(None)
-            self.ax_apod.plot(reference.ppm[ref_mask], reference.intensity[ref_mask],
-                              color='#a8b4c1', lw=.9, label='LB = 0 Гц')
-            self.ax_apod.plot(current.ppm[cur_mask], current.intensity[cur_mask],
-                              color='#254b79', lw=1., label=f'LB = {lb:g} Гц')
-            self.ax_apod.set_title('Аподизация: текущая область' if r else 'Аподизация: весь спектр', fontsize=11, loc='left')
-            self.ax_apod.set_xlim(r.high, r.low) if r else self.ax_apod.set_xlim(current.ppm[-1], current.ppm[0])
-            if local:
-                x, y, corrected, line, notes = local
-                self.ax_base.plot(x, y, color='#a8b4c1', lw=.9, label='Исходная область')
-                self.ax_base.plot(x, line, color='#d26335', lw=1., label=f'База: {b.method}')
-                self.ax_base.plot(x, corrected, color='#254b79', lw=1., label='После коррекции')
-                self.ax_base.set_xlim(r.high, r.low)
-                self.status.set(' | '.join(notes) if notes else 'Предпросмотр готов; база применяется только внутри выбранной области.')
-            else:
-                self.ax_base.text(.5, .5, 'Выберите сохранённую область обработки',
-                                  transform=self.ax_base.transAxes, ha='center')
-                self.status.set('Аподизация обновлена. Сохраните область для предпросмотра базовой линии.')
-            self.ax_base.set_title('Локальная базовая линия', fontsize=11, loc='left')
-            for ax in (self.ax_apod, self.ax_base):
-                ax.set_xlabel('ppm')
-                ax.grid(alpha=.15)
-                if ax.lines:
-                    ax.legend(fontsize=8)
-            self.canvas.draw_idle()
+            self.cached_result = result
+            self.cached_region, self.cached_baseline, self.cached_lb = r, b, lb
+            self.draw_cached()
         self.app.submit('preprocess', work, ready)
+
+    def draw_cached(self):
+        current, reference, local = self.cached_result
+        r, b, lb = self.cached_region, self.cached_baseline, self.cached_lb
+        t = self.app.t
+        self.ax_apod.clear()
+        self.ax_base.clear()
+        ref_mask = (reference.ppm >= r.low) & (reference.ppm <= r.high) if r else slice(None)
+        cur_mask = (current.ppm >= r.low) & (current.ppm <= r.high) if r else slice(None)
+        self.ax_apod.plot(reference.ppm[ref_mask], reference.intensity[ref_mask],
+                          color='#a8b4c1', lw=.9, label=t('LB = 0 Гц'))
+        self.ax_apod.plot(current.ppm[cur_mask], current.intensity[cur_mask],
+                          color='#254b79', lw=1., label=t(f'LB = {lb:g} Гц'))
+        self.ax_apod.set_title(t('Аподизация: текущая область' if r else 'Аподизация: весь спектр'), fontsize=11, loc='left')
+        self.ax_apod.set_xlim(r.high, r.low) if r else self.ax_apod.set_xlim(current.ppm[-1], current.ppm[0])
+        if local:
+            x, y, corrected, line, notes = local
+            self.ax_base.plot(x, y, color='#a8b4c1', lw=.9, label=t('Исходная область'))
+            self.ax_base.plot(x, line, color='#d26335', lw=1., label=t(f'База: {b.method}'))
+            self.ax_base.plot(x, corrected, color='#254b79', lw=1., label=t('После коррекции'))
+            self.ax_base.set_xlim(r.high, r.low)
+            self.status.set(' | '.join(notes) if notes else 'Предпросмотр готов; база применяется только внутри выбранной области.')
+        else:
+            self.ax_base.text(.5, .5, t('Выберите сохранённую область обработки'),
+                              transform=self.ax_base.transAxes, ha='center')
+            self.status.set('Аподизация обновлена. Сохраните область для предпросмотра базовой линии.')
+        self.ax_base.set_title(t('Локальная базовая линия'), fontsize=11, loc='left')
+        for ax in (self.ax_apod, self.ax_base):
+            ax.set_xlabel(t('Химический сдвиг (ppm)'))
+            ax.grid(alpha=.15)
+            if ax.lines:
+                ax.legend(fontsize=8)
+        self.canvas.draw_idle()
 
     def apply_baseline(self, all_regions=False):
         try:

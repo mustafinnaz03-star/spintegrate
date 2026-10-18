@@ -135,7 +135,9 @@ def main():
             review.draw()
             assert 'Сигнал' in review.detail_ax.get_title(loc='left')
             gui.filedialog.asksaveasfilename = lambda **_: str(target/'review.png')
-            review.save_image()
+            export = review.save_image()
+            export.window.withdraw()
+            export.save()
             assert (target/'review.png').stat().st_size > 10000
             review.figure.savefig(Path.cwd()/'test_output'/'saved_fit_review.png', dpi=130)
             # A CSV opened after the analysis loads its own recipe and archives.

@@ -16,6 +16,7 @@ import nmrglue as ng
 import numpy as np
 from pybaselines import Baseline
 from scipy.optimize import least_squares
+from .appearance import AppearanceSettings, validate_appearance, validate_color
 
 
 BASELINE_METHODS = ('none', 'asls', 'arpls', 'airpls', 'drpls', 'iasls',
@@ -82,6 +83,7 @@ class IntegrationRegion:
     parent: str
     low: float
     high: float
+    color: str | None = None
 
 
 @dataclass
@@ -91,9 +93,11 @@ class Session:
     baseline_default: BaselineSettings = field(default_factory=BaselineSettings)
     regions: list[FitRegion] = field(default_factory=list)
     integrals: list[IntegrationRegion] = field(default_factory=list)
+    appearance: AppearanceSettings = field(default_factory=AppearanceSettings)
     schema_version: int = 1
 
     def validate(self, require_regions: bool = False):
+        validate_appearance(self.appearance)
         p, f = self.processing, self.fit
         if p.phase not in PHASE_MODES or p.abs_source not in ('fid', 'spectrum'):
             raise ValueError('Неизвестный режим фазирования/abs.')
@@ -134,6 +138,7 @@ class Session:
             raise ValueError('Имена spectrum_number и spectrum_id зарезервированы для столбцов CSV.')
         parents = {r.name: r for r in self.regions}
         for r in self.integrals:
+            validate_color(r.color)
             parent = parents.get(r.parent)
             if (parent is None or not np.isfinite([r.low, r.high]).all()
                     or not parent.low <= r.low < r.high <= parent.high):
@@ -159,6 +164,7 @@ class Session:
         session = cls(
             processing=ProcessingSettings(**d['processing']), fit=FitSettings(**d['fit']),
             baseline_default=BaselineSettings(**d['baseline_default']),
+            appearance=AppearanceSettings(**d.get('appearance', {})),
             regions=[FitRegion(**{**r, 'baseline': BaselineSettings(**r['baseline'])}) for r in d['regions']],
             integrals=[IntegrationRegion(**r) for r in d['integrals']])
         session.validate()
