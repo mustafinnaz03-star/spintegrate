@@ -155,8 +155,8 @@ EN = {
     'Степень modpoly / imodpoly': 'modpoly / imodpoly order',
     'Взять базу из выбранной области': 'Load selected region settings', 'Применить к выбранной области': 'Apply to selected region',
     'Применить ко всем областям': 'Apply to all regions',
-    'Изменения здесь задают базу для новых областей. Для сохранённых областей нажмите «Применить». LB применяется сразу.':
-        'These baseline settings are defaults for new regions. Click Apply to update existing regions. LB applies immediately.',
+    'Изменения сразу сохраняются для выбранной области и новых областей. В JSON сохраняются только метод и параметры; базовая линия рассчитывается заново для каждого спектра. Для остальных областей нажмите «Применить ко всем областям».':
+        'Changes are saved immediately for the selected region and new regions. JSON stores only the method and parameters; the baseline is calculated anew for each spectrum. Use Apply to all regions for the other regions.',
     'Выберите сохранённую область в главном окне.': 'Select a saved region in the main window.',
     'Сначала сохраните область обработки.': 'Save a fitting region first.',
     'Аподизация: текущая область': 'Apodization: selected region', 'Аподизация: весь спектр': 'Apodization: full spectrum',

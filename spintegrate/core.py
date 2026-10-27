@@ -166,6 +166,7 @@ class Session:
             raise ValueError('Настройки должны содержать конечные числа.')
 
     def save(self, path):
+        """Save region bounds and algorithm parameters; no fitted baseline arrays."""
         self.validate()
         Path(path).write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2), encoding='utf-8')
 
@@ -642,6 +643,7 @@ def integrate_region(x, y, low, high):
 
 
 def direct_region(spectrum: Spectrum, region: FitRegion) -> FitResult:
+    """Estimate a fresh local baseline from this spectrum, then integrate its data."""
     x, y = integration_segment(spectrum.ppm, spectrum.intensity, region.low, region.high)
     if region.baseline.method == 'none':
         corrected, line, notes = y.copy(), np.zeros_like(y), []
@@ -651,7 +653,8 @@ def direct_region(spectrum: Spectrum, region: FitRegion) -> FitResult:
     return FitResult(region.name, x, y, line, corrected, empty.copy(), empty.copy(),
                      empty.copy(), empty.copy(), corrected.copy(), True, notes,
                      dict(method='direct', n_peaks=0, nfev=0, relative_rmse=None,
-                          integral_units='intensity*ppm'))
+                          integral_units='intensity*ppm', baseline_method=region.baseline.method,
+                          baseline_parameters=asdict(region.baseline)))
 
 
 def analyze(spectrum: Spectrum, session: Session) -> Analysis:
