@@ -54,7 +54,13 @@ EN = {
     'Аподизация / базовая линия…': 'Apodization / baseline…', 'Выполнить анализ': 'Run analysis',
     'Запомнить → серия': 'Use for batch →', 'Спектр не загружен': 'No spectrum loaded',
     'Обработка': 'Processing', 'Области': 'Regions', 'Подгонка': 'Fitting', 'Результат': 'Results',
-    'Фаза': 'Phase', 'Без коррекции': 'No correction', 'abs применяется к': 'Apply abs to',
+    'Фаза': 'Phase', 'Без коррекции': 'No correction',
+    'Повторить автофазировку': 'Recalculate automatic phase',
+    'Фаза ещё не определена.': 'Phase has not been determined.',
+    'Для автофазировки выберите ACME или peak_minima.': 'Choose ACME or peak_minima for automatic phasing.',
+    'Автокоррекция фазы вернула некорректные значения.': 'Automatic phasing returned invalid values.',
+    'Автофаза определяется один раз без дополнительного LB. Изменение аподизации не запускает новый поиск. В режиме abs используется модуль спектра после FFT.':
+        'Automatic phase is determined once without additional LB. Changing apodization does not repeat the search. The abs mode uses the magnitude of the spectrum after FFT.',
     'Начальная фаза P0, °': 'Initial P0, °', 'Начальная фаза P1, °': 'Initial P1, °',
     'Окно peak_minima, точки': 'peak_minima window, points', 'Привязка ppm': 'ppm referencing',
     'Из метаданных Bruker': 'Bruker metadata', 'Самый сильный пик': 'Strongest peak',
@@ -231,6 +237,8 @@ EN = {
 
 # Capture already-formatted arguments without changing user-controlled names.
 TEMPLATES = {
+    'Фаза P0={p0}°, P1={p1}°. Сохраняется при изменении LB.':
+        'Phase P0={p0}°, P1={p1}°. Retained when LB changes.',
     'Режим анализа: {message}': 'Analysis method: {message}',
     'Источник спектра: {source}': 'Spectrum source: {source}',
     '{name}: прямое интегрирование, точек {n}': '{name}: direct integration, {n} points',

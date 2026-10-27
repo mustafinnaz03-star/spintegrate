@@ -70,7 +70,7 @@ def test_baseline_methods_on_ascending_local_region(method):
         np.testing.assert_array_equal(corrected, y)
 
 
-def test_abs_fid_and_abs_spectrum_are_distinct_and_do_not_mutate_fid():
+def test_legacy_abs_fid_uses_spectrum_magnitude_and_does_not_mutate_fid():
     raw = demo_raw()
     original = raw.fid.copy()
     s = demo_session()
@@ -80,7 +80,7 @@ def test_abs_fid_and_abs_spectrum_are_distinct_and_do_not_mutate_fid():
     s.processing.abs_source = 'fid'
     fid_abs = process(raw, s.processing)
     assert np.min(magnitude.intensity) >= 0
-    assert not np.allclose(magnitude.intensity, fid_abs.intensity)
+    np.testing.assert_array_equal(magnitude.intensity, fid_abs.intensity)
     np.testing.assert_array_equal(raw.fid, original)
     assert np.all(np.diff(magnitude.ppm) > 0)
 

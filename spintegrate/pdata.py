@@ -87,8 +87,9 @@ def load_pdata(path, procno='1'):
                     sf, sw, str(directory), phases, notes, 'pdata', metadata)
 
 
-def process_pdata(source, p):
-    from .core import RawSpectrum, Spectrum, process
+def process_pdata(source, p, phase_cache=None):
+    from .core import (Spectrum, process_frequency_data, resolve_phase_angles,
+                       spectrum_from_fourier)
     metadata = dict(source.processing_metadata)
     has_imag = bool(metadata.get('has_imaginary', metadata.get('has_imag', False)))
     extra_transform = p.lb_hz > 0 or p.zero_fill_factor != 1 or p.phase != 'none'
@@ -99,13 +100,16 @@ def process_pdata(source, p):
         if metadata.get('cropped', False):
             raise ValueError('Дополнительная обработка через IFFT недоступна для обрезанного pdata. '
                              'Используйте исходный raw; анализ сохранённых областей pdata остаётся доступен.')
-        # This is the inverse of the *processed* spectrum, not the original FID.
-        # No saved TopSpin PHC0/PHC1 is ever applied again.
-        fid = ng.proc_base.ifft(source.complex_spectrum)
-        bins = np.fft.fftshift(np.fft.fftfreq(len(fid), d=1/source.sw_hz))
+        # Start from the saved, already phased TopSpin frequency data. Extra
+        # phase is applied before any additional window; saved PHC0/PHC1 is
+        # never applied again. With no window/padding there is no FFT roundtrip.
+        bins = np.fft.fftshift(np.fft.fftfreq(len(source.complex_spectrum), d=1/source.sw_hz))
         carrier = source.ppm[0] - bins[0]/source.sf_mhz
-        raw = RawSpectrum(fid, source.sf_mhz, source.sw_hz, carrier, source.source, list(source.notes))
-        result = process(raw, p)
+        phases, notes = resolve_phase_angles(source, p, phase_cache,
+                                             reference=source.complex_spectrum)
+        ft = process_frequency_data(source.complex_spectrum, p, source.sw_hz, phases)
+        result = spectrum_from_fourier(ft, p, source.sf_mhz, source.sw_hz, carrier,
+                                       source.source, phases, list(source.notes) + notes)
         result.source_type = 'pdata'
         result.processing_metadata = metadata
         result.processing_metadata['additional_phases'] = list(result.phases)

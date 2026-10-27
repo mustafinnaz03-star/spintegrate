@@ -19,12 +19,13 @@ from matplotlib.widgets import SpanSelector
 from .core import (BASELINE_METHODS, PHASE_MODES, BaselineSettings, FitRegion,
                    IntegrationRegion, Session, analyze, baseline_correct,
                    batch_analyze, discover_spectra, load_analysis, load_batch_results,
-                   direct_region, load_source, ProcessingSettings, pick_peaks, process, save_analysis, write_batch_csv)
+                   direct_region, load_source, PhaseState, ProcessingSettings, pick_peaks, process, save_analysis, write_batch_csv)
 from .demo import demo_raw, demo_session, write_demo_series, write_pdata_demo_series
 from .plotting import draw_spectrum
 from .appearance import AREA_COLORS, AppearanceSettings, area_color, validate_appearance
 from .figure_export import render_fit_figure, save_figure
 from .i18n import TranslatedVar, canonical, set_label, tr, translate_widgets, widget_language
+from .region_names import next_region_name
 
 
 PHASE_LABELS = {'Без коррекции': 'none', 'ACME (nmrglue)': 'acme',
@@ -186,6 +187,11 @@ class SpintegrateApp:
         self.review_windows = []
         self.export_windows = []
         self.preview_local = None
+        self.phase_state = PhaseState()
+        self._last_auto_name = 'region_1'
+        self._naming_sync = False
+        self._region_events_suspended = 0
+        self._region_event_timers = set()
         self.preprocess_window = None
         self.status = TranslatedVar(root, value='Откройте папку эксперимента Bruker или демонстрационный спектр.')
         self._build()
@@ -250,8 +256,6 @@ class SpintegrateApp:
         p = self.session.processing
         add = self.processing_fields.add
         add('phase_label', 'Фаза', 'Без коррекции', list(PHASE_LABELS), str)
-        add('abs_source', 'abs применяется к', p.abs_source, ['spectrum', 'fid'], str,
-            'spectrum = |FFT(FID)|; fid = Re FFT(|FID|).')
         add('p0', 'Начальная фаза P0, °', p.p0)
         add('p1', 'Начальная фаза P1, °', p.p1)
         add('phase_peak_width', 'Окно peak_minima, точки', p.phase_peak_width, kind=int)
@@ -265,12 +269,20 @@ class SpintegrateApp:
             add('remove_digital_filter', 'Удалить цифровой фильтр', p.remove_digital_filter, kind=bool)
         else:
             add('pdata_procno', 'Номер pdata (procno)', p.pdata_procno, kind=str)
+        self.rephase_button = ttk.Button(processing_tab, text='Повторить автофазировку', command=self.rephase_spectrum)
+        self.rephase_button.pack(fill='x', padx=8, pady=5)
+        self.phase_summary = ttk.Label(processing_tab, text='Фаза ещё не определена.', wraplength=365)
+        self.phase_summary.pack(fill='x', padx=8, pady=3)
         explanation = ('P0/P1 — старт автоматического фазирования. «Без коррекции» показывает реальную часть FFT.\n'
                        'LB настраивается в отдельном окне.' if self.source_mode == 'raw' else
                        'По умолчанию используются 1r и ppm-шкала TopSpin. Фазы PHC0/PHC1 повторно не применяются. '
                        'Выбранные здесь фаза, LB и zero filling — дополнительная обработка; для неё нужен канал 1i.')
         ttk.Label(processing_tab, text=explanation, wraplength=365,
                   foreground='#65758a').pack(padx=8, pady=10, anchor='w')
+        ttk.Label(processing_tab,
+                  text='Автофаза определяется один раз без дополнительного LB. Изменение аподизации не запускает новый поиск. '
+                       'В режиме abs используется модуль спектра после FFT.',
+                  wraplength=365, foreground='#65758a').pack(padx=8, pady=(0, 8), anchor='w')
         self._build_regions(region_tab)
         self.fit_fields = FieldPanel(fit_tab, self.fit_settings_changed)
         self.fit_fields.pack(fill='x')
@@ -337,6 +349,7 @@ class SpintegrateApp:
         ttk.Radiobutton(modes, text='Обработка', variable=self.selection_mode, value='fit').pack(side='left')
         ttk.Radiobutton(modes, text='Интеграл', variable=self.selection_mode, value='integral').pack(side='left')
         self.region_name = tk.StringVar(value='region_1')
+        self.selection_mode.trace_add('write', lambda *_: self.prepare_region_name())
         self.bound_low, self.bound_high = tk.StringVar(value='3.0'), tk.StringVar(value='4.0')
         form = ttk.Frame(parent, padding=8)
         form.pack(fill='x')
@@ -458,6 +471,8 @@ class SpintegrateApp:
         self.update_analysis_controls()
         self.loading_settings = False
         self.refresh_regions()
+        self.prepare_region_name(force=True)
+        self.update_phase_controls()
         if self.language != self.session.appearance.language:
             self.set_language(self.session.appearance.language)
 
@@ -515,6 +530,7 @@ class SpintegrateApp:
         for k, v in p.items():
             setattr(s.processing, k, v)
         s.processing.source_mode = self.source_mode
+        s.processing.abs_source = 'spectrum'
         s.analysis_method = ANALYSIS_LABELS[canonical(self.fit_fields.vars['analysis_label'].get())]
         if s.analysis_method == 'lorentzian':
             for k, v in self.fit_fields.values().items():
@@ -535,6 +551,21 @@ class SpintegrateApp:
     def settings_changed(self):
         if self.loading_settings:
             return
+        self.update_phase_controls()
+        self.invalidate()
+        self.schedule_preview()
+
+    def update_phase_controls(self):
+        phase = PHASE_LABELS[canonical(self.processing_fields.vars['phase_label'].get())]
+        self.rephase_button.configure(state='normal' if phase in ('acme', 'peak_minima') else 'disabled')
+
+    def rephase_spectrum(self):
+        phase = PHASE_LABELS[canonical(self.processing_fields.vars['phase_label'].get())]
+        if phase not in ('acme', 'peak_minima'):
+            self.status.set('Для автофазировки выберите ACME или peak_minima.')
+            return
+        # Swap state rather than waiting on an optimization already running in a worker.
+        self.phase_state = PhaseState()
         self.invalidate()
         self.schedule_preview()
 
@@ -657,6 +688,8 @@ class SpintegrateApp:
                 self.loading_settings = False
                 recipe.processing.pdata_procno = selected.name
         self.invalidate()
+        self.phase_state = PhaseState()
+        set_label(self.phase_summary, 'Фаза ещё не определена.')
         self.source_path = str(path)
         self.raw = self.spectrum = None
         self.pending_preview = None
@@ -679,6 +712,8 @@ class SpintegrateApp:
         self.session.processing.source_mode = self.source_mode
         self._sync_widgets()
         self.invalidate()
+        self.phase_state = PhaseState()
+        set_label(self.phase_summary, 'Фаза ещё не определена.')
         self.raw = demo_raw()
         if self.source_mode == 'pdata':
             self.session.processing.lb_hz = 0.
@@ -715,8 +750,9 @@ class SpintegrateApp:
     def _submit_preview(self, raw, recipe, generation, revision):
         self.status.set('Обновляю спектр и локальную базовую линию…')
         selected = next((r for r in recipe.regions if r.name == self.selected_region), None)
+        phase_state = self.phase_state
         def work():
-            spectrum = process(raw, recipe.processing)
+            spectrum = process(raw, recipe.processing, phase_cache=phase_state)
             local = None
             if selected:
                 if recipe.analysis_method == 'direct':
@@ -737,6 +773,8 @@ class SpintegrateApp:
             self.session.fit = recipe.fit
             self.session.analysis_method = recipe.analysis_method
             self.spectrum, local = result
+            set_label(self.phase_summary, f'Фаза P0={self.spectrum.phases[0]:.3f}°, P1={self.spectrum.phases[1]:.3f}°. '
+                      'Сохраняется при изменении LB.')
             self.preview_local = local
             self.draw(local=local)
             self.status.set(f'Спектр готов. LB={recipe.processing.lb_hz:g} Гц; '
@@ -783,11 +821,34 @@ class SpintegrateApp:
             return
         self.bound_low.set(f'{min(low, high):.6f}')
         self.bound_high.set(f'{max(low, high):.6f}')
+        self.prepare_region_name()
+        self._suspend_region_events()
+        for tree in (self.region_tree, self.area_tree):
+            tree.selection_remove(*tree.selection())
         set_label(self.selection_label, f'Выбрано {min(low, high):.6f}…{max(low, high):.6f} ppm. '
                                        'Нажмите «Сохранить область».')
         self.control_tabs.select(1)
 
+    def _suspend_region_events(self):
+        self._region_events_suspended += 1
+        def resume():
+            self._region_event_timers.discard(timer)
+            self._region_events_suspended = max(0, self._region_events_suspended-1)
+        timer = self.root.after_idle(resume)
+        self._region_event_timers.add(timer)
+
+    def prepare_region_name(self, force=False):
+        if self.loading_settings or self._naming_sync or not hasattr(self, 'region_name'):
+            return
+        current = self.region_name.get().strip()
+        existing = {r.name for r in [*self.session.regions, *self.session.integrals]}
+        if force or not current or current == self._last_auto_name or current in existing:
+            name = next_region_name(self.selection_mode.get(), self.session.regions, self.session.integrals)
+            self._last_auto_name = name
+            self.region_name.set(name)
+
     def refresh_regions(self):
+        self._suspend_region_events()
         self.loading_settings = True
         for tree in (self.region_tree, self.area_tree):
             for item in tree.get_children():
@@ -811,6 +872,9 @@ class SpintegrateApp:
     def _region_from_fields(self):
         low, high = sorted((float(self.bound_low.get()), float(self.bound_high.get())))
         name = self.region_name.get().strip()
+        if not name:
+            name = next_region_name(self.selection_mode.get(), self.session.regions, self.session.integrals)
+            self.region_name.set(name)
         if self.selection_mode.get() == 'fit':
             return FitRegion(name, low, high, copy.deepcopy(self.session.baseline_default))
         return IntegrationRegion(name, self.parent_region.get(), low, high, self.integration_color.get())
@@ -839,10 +903,14 @@ class SpintegrateApp:
             self.session = s
             if isinstance(region, FitRegion):
                 self.selected_region = region.name
-            self.region_name.set(('region_' if isinstance(region, FitRegion) else 'signal_') + str(len(target)+1))
+            else:
+                self.selected_region = region.parent
             self.integration_color.set(AREA_COLORS[len(s.integrals) % len(AREA_COLORS)])
             self.color_swatch.configure(background=self.integration_color.get())
             self.refresh_regions()
+            self.prepare_region_name(force=True)
+            for tree in (self.region_tree, self.area_tree):
+                tree.selection_remove(*tree.selection())
             self.invalidate()
             self.preview()
         except (ValueError, KeyError) as exc:
@@ -876,7 +944,7 @@ class SpintegrateApp:
             self.error(str(exc))
 
     def select_region(self, _=None):
-        if self.loading_settings:
+        if self.loading_settings or self._region_events_suspended:
             return
         selection = self.region_tree.selection()
         if not selection:
@@ -884,8 +952,10 @@ class SpintegrateApp:
         self.selected_region = selection[0]
         r = next(r for r in self.session.regions if r.name == self.selected_region)
         self.parent_region.set(r.name)
+        self._naming_sync = True
         self.selection_mode.set('fit')
         self.region_name.set(r.name)
+        self._naming_sync = False
         self.bound_low.set(str(r.low))
         self.bound_high.set(str(r.high))
         if self.analysis:
@@ -896,14 +966,16 @@ class SpintegrateApp:
             self.preprocess_window.refresh()
 
     def select_area(self, _=None):
-        if self.loading_settings:
+        if self.loading_settings or self._region_events_suspended:
             return
         selection = self.area_tree.selection()
         if not selection:
             return
         r = next(r for r in self.session.integrals if r.name == selection[0])
+        self._naming_sync = True
         self.selection_mode.set('integral')
         self.region_name.set(r.name)
+        self._naming_sync = False
         self.parent_region.set(r.parent)
         self.bound_low.set(str(r.low))
         self.bound_high.set(str(r.high))
@@ -955,13 +1027,14 @@ class SpintegrateApp:
         self.status.set('Интегрирование областей…' if recipe.analysis_method == 'direct' else
                         'Подгонка областей… Интерфейс доступен; изменение параметров отменит показ старого результата.')
         raw = self.raw
+        phase_state = self.phase_state
         path = self.source_path
         reload = bool(path and ((self.source_mode == 'raw' and self.loaded_filter != recipe.processing.remove_digital_filter)
                       or (self.source_mode == 'pdata' and str(recipe.processing.pdata_procno) != self.loaded_procno)))
         selected_path = self.input_path(recipe.processing) if reload else path
         def work():
             source = load_source(selected_path, recipe.processing) if reload else raw
-            return analyze(process(source, recipe.processing), recipe)
+            return analyze(process(source, recipe.processing, phase_cache=phase_state), recipe)
         self.submit('fit', work, self.analysis_ready, self.generation)
 
     def analysis_ready(self, analysis):
@@ -1320,6 +1393,10 @@ class SpintegrateApp:
             self.root.after_cancel(self.poll_timer)
         if self.preview_timer:
             self.root.after_cancel(self.preview_timer)
+        for timer in self._region_event_timers:
+            self.root.after_cancel(timer)
+        self._region_event_timers.clear()
+        self._region_events_suspended = 0
         if self.preprocess_window and self.preprocess_window.window.winfo_exists():
             self.preprocess_window.close()
         self.executor.shutdown(wait=False, cancel_futures=True)
@@ -1621,6 +1698,7 @@ class PreprocessWindow:
             self.revision += 1
             self.requested_key = key
         revision, generation, raw = self.revision, self.app.generation, self.app.raw
+        phase_state = self.app.phase_state
         if 'preprocess' in self.app.jobs:
             # Do not queue unbounded jobs while dragging a slider.
             if self.timer:
@@ -1628,10 +1706,10 @@ class PreprocessWindow:
             self.timer = self.window.after(120, self.refresh)
             return
         def work():
-            current = process(raw, recipe.processing)
+            current = process(raw, recipe.processing, phase_cache=phase_state)
             no_apod = copy.deepcopy(recipe.processing)
             no_apod.lb_hz = 0.
-            reference = process(raw, no_apod)
+            reference = process(raw, no_apod, phase_cache=phase_state)
             baseline_data = None
             if r:
                 mask = (current.ppm >= r.low) & (current.ppm <= r.high)

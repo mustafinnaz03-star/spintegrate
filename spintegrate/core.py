@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv
 import json
 import warnings
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -39,7 +40,7 @@ class BaselineSettings:
 @dataclass
 class ProcessingSettings:
     phase: str = 'none'
-    abs_source: str = 'spectrum'  # 'fid': literal abs(FID) BEFORE FFT
+    abs_source: str = 'spectrum'  # deprecated compatibility field; abs always means |spectrum|
     lb_hz: float = 1.0
     p0: float = 0.0
     p1: float = 0.0
@@ -53,6 +54,10 @@ class ProcessingSettings:
     remove_digital_filter: bool = True
     source_mode: str = 'raw'
     pdata_procno: str = '1'
+
+    def __post_init__(self):
+        # Older recipes offered abs(FID). That option is intentionally retired.
+        self.abs_source = 'spectrum'
 
 
 @dataclass
@@ -108,7 +113,7 @@ class Session:
             raise ValueError('Источник спектра должен быть raw или pdata.')
         if p.source_mode == 'pdata' and (not str(p.pdata_procno).isdigit() or int(p.pdata_procno) < 1):
             raise ValueError('Номер обработки pdata должен быть положительным целым числом.')
-        if p.phase not in PHASE_MODES or p.abs_source not in ('fid', 'spectrum'):
+        if p.phase not in PHASE_MODES:
             raise ValueError('Неизвестный режим фазирования/abs.')
         if p.reference_mode not in ('metadata', 'strongest', 'window'):
             raise ValueError('Неизвестный режим привязки ppm.')
@@ -265,59 +270,128 @@ def load_source(path, p: ProcessingSettings):
     raise ValueError('Источник спектра должен быть raw или pdata.')
 
 
-def process(raw: RawSpectrum | Spectrum, p: ProcessingSettings) -> Spectrum:
-    Session(processing=p).validate()
-    if isinstance(raw, Spectrum):
-        from .pdata import process_pdata
-        return process_pdata(raw, p)
-    fid = raw.fid.copy()
-    if p.phase == 'abs' and p.abs_source == 'fid':
-        fid = np.abs(fid).astype(complex)
-    # nmrglue expects normalized LB; the UI and JSON use physical Hz.
-    fid = ng.proc_base.em(fid, lb=p.lb_hz / raw.sw_hz)
-    if p.zero_fill_factor > 1:
-        fid = ng.proc_base.zf_size(fid, raw.fid.size * p.zero_fill_factor)
-    ft = ng.proc_base.fft(fid)
-    phases = (0., 0.)
-    notes = list(raw.notes)
-    if p.phase in ('acme', 'peak_minima'):
-        # Both built-in scoring modes are evaluated by nmrglue's autops.
+class PhaseState:
+    """Thread-safe resolved phases for immutable loaded source objects.
+
+    Keep one state per open spectrum and share it between preview and analysis.
+    LB, zero filling, references and baseline settings do not change phase fits.
+    ``clear()`` is the explicit request to estimate the same source again.
+    Strong source references prevent Python object-id reuse from mixing files.
+    """
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._entries = {}
+
+    def clear(self):
+        with self._lock:
+            self._entries.clear()
+
+    def resolve(self, source, settings, estimate):
+        key = (id(source), settings.phase, float(settings.p0), float(settings.p1),
+               int(settings.phase_peak_width))
+        with self._lock:
+            cached = self._entries.get(key)
+            if cached is None:
+                phases, notes = estimate()
+                cached = (source, tuple(phases), tuple(notes))
+                self._entries[key] = cached
+            return cached[1], list(cached[2])
+
+
+def resolve_phase_angles(source, p, phase_cache=None, reference=None):
+    """Estimate auto phases from the original, unapodized frequency data only."""
+    if p.phase not in ('acme', 'peak_minima'):
+        return (0., 0.), []
+    def estimate():
+        data = reference
+        if data is None:
+            data = (source.complex_spectrum if isinstance(source, Spectrum)
+                    else ng.proc_base.fft(source.fid))
+        data = np.asarray(data)
         counts = {'evaluations': 0, 'iterations': 0}
-        peak_width = min(p.phase_peak_width, max(1, len(ft)//4))
-        def score(phases, data):
+        peak_width = min(p.phase_peak_width, max(1, len(data)//4))
+        def score(phases, values):
             counts['evaluations'] += 1
             if p.phase == 'acme':
-                return ng.proc_autophase._ps_acme_score(phases, data)
-            # The built-in peak_minima scorer assumes a peak away from either
-            # edge. Give a readable failure rather than silently alter the data.
+                return ng.proc_autophase._ps_acme_score(phases, values)
             try:
-                return ng.proc_autophase._ps_peak_minima_score(phases, data, peak_width)
+                return ng.proc_autophase._ps_peak_minima_score(phases, values, peak_width)
             except ValueError as exc:
                 raise ValueError('peak_minima: недостаточно точек около максимума. '
                                  'Уменьшите окно peak_minima или выберите ACME.') from exc
         def iteration(_):
             counts['iterations'] += 1
         with warnings.catch_warnings(record=True) as caught:
-            phased, optimized = ng.proc_autophase.autops(
-                ft, score, p0=p.p0, p1=p.p1, return_phases=True,
+            _, optimized = ng.proc_autophase.autops(
+                data, score, p0=p.p0, p1=p.p1, return_phases=True,
                 disp=False, maxiter=1000, maxfun=2000, ftol=1e-6, callback=iteration)
         phases = tuple(float(v) for v in optimized)
-        y = phased.real
-        notes.extend(str(w.message) for w in caught)
+        if len(phases) != 2 or not np.isfinite(phases).all():
+            raise ValueError('Автокоррекция фазы вернула некорректные значения.')
+        notes = [str(w.message) for w in caught]
         if counts['evaluations'] >= 2000 or counts['iterations'] >= 999:
             notes.append('Автокоррекция фазы достигла лимита оптимизации; проверьте фазу вручную.')
-    elif p.phase == 'abs' and p.abs_source == 'spectrum':
+        return phases, notes
+    return phase_cache.resolve(source, p, estimate) if phase_cache is not None else estimate()
+
+
+def process(raw: RawSpectrum | Spectrum, p: ProcessingSettings, phase_cache=None) -> Spectrum:
+    Session(processing=p).validate()
+    if isinstance(raw, Spectrum):
+        from .pdata import process_pdata
+        return process_pdata(raw, p, phase_cache=phase_cache)
+    # Phase the original frequency data first. First-order phase and a
+    # time-domain window do not commute, so applying fixed angles *after*
+    # apodization would still change the result of this ordered workflow.
+    if p.phase in ('acme', 'peak_minima'):
+        base = ng.proc_base.fft(raw.fid)
+        phases, resolved_notes = resolve_phase_angles(raw, p, phase_cache, reference=base)
+        ft = process_frequency_data(base, p, raw.sw_hz, phases)
+    else:
+        phases, resolved_notes = (0., 0.), []
+        fid = apodize_fid(raw.fid.copy(), p, raw.sw_hz)
+        ft = ng.proc_base.fft(fid)
+    notes = list(raw.notes) + resolved_notes
+    return spectrum_from_fourier(ft, p, raw.sf_mhz, raw.sw_hz, raw.carrier_ppm,
+                                 raw.source, phases, notes)
+
+
+def apodize_fid(fid, p, sw_hz):
+    """Apply the requested time-domain window and padding, without phasing."""
+    original_size = len(fid)
+    # nmrglue expects normalized LB; the UI and JSON use physical Hz.
+    if p.lb_hz > 0:
+        fid = ng.proc_base.em(fid, lb=p.lb_hz / sw_hz)
+    if p.zero_fill_factor > 1:
+        fid = ng.proc_base.zf_size(fid, original_size * p.zero_fill_factor)
+    return fid
+
+
+def process_frequency_data(base, p, sw_hz, phases):
+    """Phase original frequency data before any additional apodization."""
+    if p.phase in ('acme', 'peak_minima'):
+        phased = ng.proc_base.ps(base, p0=phases[0], p1=phases[1])
+    else:
+        phased = np.asarray(base).copy()
+    if p.lb_hz == 0 and p.zero_fill_factor == 1:
+        return phased
+    fid = ng.proc_base.ifft(phased)
+    return ng.proc_base.fft(apodize_fid(fid, p, sw_hz))
+
+
+def spectrum_from_fourier(ft, p, sf_mhz, sw_hz, carrier_ppm, source, phases, notes):
+    """Construct the shared raw/pdata output after all spectral operations."""
+    notes = list(notes)
+    if p.phase == 'abs':
         y = np.abs(ft)
         notes.append('abs спектра: форма magnitude-пика отличается от чистого Лоренца.')
     else:
         y = ft.real
-        if p.phase == 'abs':
-            notes.append('abs(FID) до FFT: фазовая/частотная информация FID потеряна.')
     # ng.fft implements fftshift(fft). The original notebook assigns increasing
     # frequencies to these bins. Keep that orientation, with exact bin spacing
     # instead of endpoint-inclusive linspace; sort/invert only for display.
-    frequencies = np.fft.fftshift(np.fft.fftfreq(len(ft), d=1/raw.sw_hz))
-    ppm = raw.carrier_ppm + frequencies / raw.sf_mhz
+    frequencies = np.fft.fftshift(np.fft.fftfreq(len(ft), d=1/sw_hz))
+    ppm = carrier_ppm + frequencies / sf_mhz
     if p.reference_mode != 'metadata':
         mask = np.ones(len(ppm), dtype=bool)
         if p.reference_mode == 'window':
@@ -334,8 +408,8 @@ def process(raw: RawSpectrum | Spectrum, p: ProcessingSettings) -> Spectrum:
     order = np.argsort(ppm)
     if not np.isfinite(y).all():
         raise ValueError('После обработки появились нечисловые значения.')
-    return Spectrum(ppm[order], np.asarray(y)[order], ft[order], raw.sf_mhz,
-                    raw.sw_hz, raw.source, phases, notes)
+    return Spectrum(ppm[order], np.asarray(y)[order], ft[order], sf_mhz,
+                    sw_hz, source, phases, notes)
 
 
 def baseline_correct(x, y, b: BaselineSettings):
