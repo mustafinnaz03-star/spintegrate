@@ -4,7 +4,7 @@ import nmrglue as ng
 import numpy as np
 
 from .core import (BaselineSettings, FitRegion, IntegrationRegion,
-                   RawSpectrum, Session)
+                   ProcessingSettings, RawSpectrum, Session, process)
 
 
 def demo_raw(multiplier=1., source='Синтетический спектр'):
@@ -44,4 +44,30 @@ def write_demo_series(directory):
         np.savez(directory / f'{number}.npz', fid=raw.fid, sf_mhz=raw.sf_mhz,
                  sw_hz=raw.sw_hz, carrier_ppm=raw.carrier_ppm)
     demo_session().save(directory / 'demo.settings.json')
+    return directory
+
+
+def write_pdata_demo_series(directory, procno='1'):
+    """Create self-contained synthetic TopSpin-like 1r/1i/procs examples."""
+    directory = Path(directory)
+    for number, multiplier in enumerate((1., .8, .6, .4), 1):
+        spectrum = process(demo_raw(multiplier), ProcessingSettings(lb_hz=0.))
+        target = directory / str(number) / 'pdata' / str(procno)
+        target.mkdir(parents=True, exist_ok=True)
+        size = len(spectrum.ppm)
+        dic = {'procs': {
+            '_coreheader': ['##TITLE= Synthetic Spintegrate pdata demo', '##JCAMPDX= 5.00'],
+            '_comments': [], 'SI': size, 'XDIM': size, 'FTSIZE': size,
+            'STSI': 0, 'STSR': 0, 'PPARMOD': 0, 'BYTORDP': 0, 'DTYPP': 2, 'NC_proc': 0,
+            'SF': spectrum.sf_mhz, 'SW_p': spectrum.sw_hz, 'OFFSET': float(spectrum.ppm[-1]),
+            'PHC0': 0., 'PHC1': 0., 'LB': 0.,
+        }}
+        ng.bruker.write_pdata(str(target), dic, spectrum.complex_spectrum.real[::-1],
+                             scale_data=True, write_procs=True, isfloat=True)
+        ng.bruker.write_pdata(str(target), dic, spectrum.complex_spectrum.imag[::-1],
+                             scale_data=True, bin_file='1i', isfloat=True)
+    recipe = demo_session()
+    recipe.processing.source_mode = 'pdata'
+    recipe.processing.pdata_procno = str(procno)
+    recipe.save(directory / 'demo.pdata.settings.json')
     return directory

@@ -6,6 +6,47 @@ from tkinter import ttk
 
 
 EN = {
+    'Spintegrate — анализ спектров ЯМР (raw)': 'Spintegrate — raw NMR analysis',
+    'Spintegrate — анализ из pdata': 'Spintegrate — processed pdata analysis',
+    'Анализировать pdata…': 'Analyze pdata…', 'Анализировать raw…': 'Analyze raw…',
+    'Открыть pdata…': 'Open pdata…', 'Номер pdata (procno)': 'pdata processing number',
+    'Метод анализа': 'Analysis method', 'Деконволюция Лоренцами': 'Lorentzian deconvolution',
+    'Весь спектр + область + интеграл': 'Full spectrum + region + integral', 'Область + интеграл': 'Region + integral',
+    'Неизвестный метод анализа: lorentzian или direct.': 'Analysis method must be lorentzian or direct.',
+    'Источник спектра должен быть raw или pdata.': 'Spectrum source must be raw or pdata.',
+    'Прямое интегрирование областей': 'Direct region integration',
+    'Прямое интегрирование': 'Direct integration',
+    'Накопленный интеграл по областям': 'Cumulative region integrals',
+    'Интеграл (инт. × ppm)': 'Integral (intensity × ppm)',
+    'По умолчанию используются 1r и ppm-шкала TopSpin. Фазы PHC0/PHC1 повторно не применяются. Выбранные здесь фаза, LB и zero filling — дополнительная обработка; для неё нужен канал 1i.':
+        'By default, TopSpin 1r and its ppm scale are used. PHC0/PHC1 are not applied again. Phase, LB and zero filling here are additional processing and require 1i.',
+    'Прямой интеграл = ∫ I(ppm) dppm после локальной коррекции базовой линии. Поиск пиков и подгонка не выполняются. Отрицательные сигналы дают отрицательный вклад.':
+        'Direct integral = ∫ I(ppm) dppm after local baseline correction. No peak picking or optimization is used. Negative signals contribute negative area.',
+    'Папка pdata с 1r и procs или папка эксперимента': 'pdata folder with 1r and procs, or experiment folder',
+    'Загрузка pdata…': 'Loading processed pdata…', 'Интегрирование областей…': 'Integrating regions…',
+    'Создана синтетическая серия из четырёх pdata.': 'Created four synthetic pdata spectra.',
+    'Сохранить интегралы CSV…': 'Export integrals CSV…',
+    'Единицы: интенсивность × ppm; численный интеграл по точным границам.':
+        'Units: intensity × ppm; numerical integration with exact bounds.',
+    'Прямое интегрирование: поиск пиков и оптимизация не используются.': 'Direct integration: no peak picking or optimization.',
+    'Для дополнительной аподизации, фазировки, abs или zero filling pdata нужен файл 1i. Без 1i доступны исходная фазировка TopSpin, базовая линия и анализ областей.':
+        'Additional pdata apodization, phase correction, abs or zero filling requires 1i. Without it, imported TopSpin phasing, local baseline correction and region analysis remain available.',
+    'Дополнительная обработка применена к спектру после TopSpin; исходная фазировка не повторяется.':
+        'Additional processing was applied after TopSpin; imported phase correction was not repeated.',
+    'Номер обработки pdata должен быть положительным целым числом.': 'pdata processing number must be a positive integer.',
+    'Для pdata выберите файл 1r или папку с 1r и procs.': 'For pdata, select 1r or a folder containing 1r and procs.',
+    'Поддерживаются только одномерные обработанные спектры pdata.': 'Only one-dimensional processed pdata spectra are supported.',
+    'В procs нужны корректные SF, SW_p, OFFSET и SI для шкалы TopSpin.': 'Valid SF, SW_p, OFFSET and SI in procs are required for the TopSpin axis.',
+    'Некорректная шкала TopSpin: SF, SW_p, OFFSET или SI.': 'Invalid TopSpin axis: SF, SW_p, OFFSET or SI.',
+    'Файлы 1r/1i короче размера, указанного в procs.': '1r/1i are shorter than the size specified in procs.',
+    'В обработанном спектре есть нечисловые значения.': 'Processed spectrum contains nonfinite values.',
+    'Некорректные PHC0/PHC1 в procs.': 'Invalid PHC0/PHC1 in procs.',
+    'Обрезанные pdata (STSR/STSI/FTSIZE) пока не поддерживаются: сохраните полный спектр в TopSpin или откройте raw, чтобы не исказить шкалу ppm.':
+        'Cropped pdata (STSR/STSI/FTSIZE) is not supported yet. Save a full spectrum in TopSpin or open raw to preserve the ppm axis.',
+    'Для интегрирования нужны конечные одномерные массивы одинаковой длины.': 'Integration requires finite 1D arrays of equal length.',
+    'Шкала интегрирования должна быть строго монотонной без повторов.': 'Integration axis must be strictly monotonic without duplicates.',
+    'Для интегрирования нужны две различные границы low < high.': 'Integration requires two distinct bounds low < high.',
+    'Область интегрирования выходит за диапазон спектра.': 'Integration region is outside the spectrum.',
     'Spintegrate — анализ спектров ЯМР': 'Spintegrate — NMR spectrum analysis',
     'Загрузить настройки JSON': 'Load JSON settings', 'Сохранить настройки JSON': 'Save JSON settings',
     'Один спектр': 'Single spectrum', 'Много спектров': 'Batch analysis',
@@ -190,6 +231,16 @@ EN = {
 
 # Capture already-formatted arguments without changing user-controlled names.
 TEMPLATES = {
+    'Режим анализа: {message}': 'Analysis method: {message}',
+    'Источник спектра: {source}': 'Spectrum source: {source}',
+    '{name}: прямое интегрирование, точек {n}': '{name}: direct integration, {n} points',
+    'Сохранено областей интегрирования: {n}. Численный интеграл: интенсивность × ppm.':
+        'Saved integration regions: {n}. Numerical integral: intensity × ppm.',
+    'Сохранены CSV интегралов и JSON настроек: {path}': 'Saved integrals CSV and settings JSON: {path}',
+    'Проверка интегрирования — {name}': 'Integration review — {name}',
+    'Интеграл {name}: {value} (интенсивность × ppm)': 'Integral {name}: {value} (intensity × ppm)',
+    'Не найдены 1r и procs для обработки pdata/{procno}: {path}': 'Missing 1r and procs for pdata/{procno}: {path}',
+    'Не найдены 1r/procs для обработки pdata/{procno}.': 'No 1r/procs found for pdata/{procno}.',
     'Проверьте значение поля «{field}».': 'Check the value of “{field}”.',
     'Серия: {n}/{total}, {source} — {status}': 'Batch: {n}/{total}, {source} — {status}',
     'Спектр готов. LB={lb} Гц; P0/P1={phases}°. {message}': 'Spectrum ready. LB={lb} Hz; P0/P1={phases}°. {message}',
@@ -354,4 +405,6 @@ def translate_widgets(widget, language):
     if hasattr(widget, 'translate_choices'):
         widget.translate_choices(language)
     for child in widget.winfo_children():
+        if isinstance(child, tk.Toplevel) and getattr(child, '_spintegrate_source_window', False):
+            continue  # independent source workspaces keep their own language/settings
         translate_widgets(child, language)

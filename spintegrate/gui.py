@@ -19,8 +19,8 @@ from matplotlib.widgets import SpanSelector
 from .core import (BASELINE_METHODS, PHASE_MODES, BaselineSettings, FitRegion,
                    IntegrationRegion, Session, analyze, baseline_correct,
                    batch_analyze, discover_spectra, load_analysis, load_batch_results,
-                   load_raw, pick_peaks, process, save_analysis, write_batch_csv)
-from .demo import demo_raw, demo_session, write_demo_series
+                   direct_region, load_source, ProcessingSettings, pick_peaks, process, save_analysis, write_batch_csv)
+from .demo import demo_raw, demo_session, write_demo_series, write_pdata_demo_series
 from .plotting import draw_spectrum
 from .appearance import AREA_COLORS, AppearanceSettings, area_color, validate_appearance
 from .figure_export import render_fit_figure, save_figure
@@ -31,13 +31,14 @@ PHASE_LABELS = {'Без коррекции': 'none', 'ACME (nmrglue)': 'acme',
                 'Peak minima (nmrglue)': 'peak_minima', 'abs': 'abs'}
 REF_LABELS = {'Из метаданных Bruker': 'metadata', 'Самый сильный пик': 'strongest',
               'Пик в заданном ppm-окне': 'window'}
+ANALYSIS_LABELS = {'Деконволюция Лоренцами': 'lorentzian', 'Прямое интегрирование областей': 'direct'}
 
 
 class FieldPanel(ttk.Frame):
     """Compact labeled input rows with typed values and a single edit callback."""
     def __init__(self, parent, callback=None):
         super().__init__(parent, padding=8)
-        self.vars, self.types, self.choice_widgets = {}, {}, {}
+        self.vars, self.types, self.choice_widgets, self.widgets = {}, {}, {}, {}
         self.callback = callback
         self.columnconfigure(1, weight=1)
 
@@ -57,6 +58,7 @@ class FieldPanel(ttk.Frame):
             ttk.Label(self, text=hint, foreground='#65758a', wraplength=355,
                       font=('Segoe UI', 8)).grid(row=row+1, column=0, columnspan=2, sticky='w')
         self.vars[key], self.types[key] = var, kind
+        self.widgets[key] = widget
         if self.callback:
             var.trace_add('write', lambda *_: self.callback())
         return var
@@ -85,6 +87,10 @@ class FieldPanel(ttk.Frame):
             translated = tr(value, language)
             if translated != self.vars[key].get():
                 self.vars[key].set(translated)
+
+    def enable(self, key, enabled):
+        widget = self.widgets[key]
+        widget.configure(state=('readonly' if key in self.choice_widgets else 'normal') if enabled else 'disabled')
 
 
 def scrolled_text(parent, height=8):
@@ -134,11 +140,19 @@ class ScrollPanel(ttk.Frame):
 
 
 class SpintegrateApp:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, source_mode='raw', parent_app=None):
+        if source_mode not in ('raw', 'pdata'):
+            raise ValueError('Unknown spectrum source')
         self.root = root
+        root._spintegrate_source_window = True
+        self.source_mode = source_mode
+        self.parent_app = parent_app
+        self.source_windows = []
+        self.closed = False
+        self.poll_timer = None
         self.language = 'ru'
         root._spintegrate_language = self.language
-        root.title('Spintegrate — анализ спектров ЯМР')
+        root.title('Spintegrate — анализ из pdata' if source_mode == 'pdata' else 'Spintegrate — анализ спектров ЯМР (raw)')
         root.geometry('1400x920')
         root.minsize(1080, 750)
         style = ttk.Style(root)
@@ -147,8 +161,13 @@ class SpintegrateApp:
         style.configure('TNotebook.Tab', padding=(12, 7))
         style.configure('Treeview', rowheight=25, font=('Segoe UI', 9))
         self.session = Session()
+        self.session.processing.source_mode = source_mode
+        if source_mode == 'pdata':
+            self.session.processing.lb_hz = 0.
+            self.session.baseline_default.method = 'none'
         self.raw = self.spectrum = self.analysis = None
         self.loaded_filter = True
+        self.loaded_procno = None
         self.source_path = None
         self.selected_region = None
         self.generation = 0
@@ -172,7 +191,7 @@ class SpintegrateApp:
         self._build()
         self._sync_widgets()
         self.set_language(self.language)
-        root.after(80, self._poll)
+        self.poll_timer = root.after(80, self._poll)
         root.protocol('WM_DELETE_WINDOW', self.close)
 
     def _build(self):
@@ -195,8 +214,10 @@ class SpintegrateApp:
         self.tabs.add(self.batch_tab, text='Много спектров')
         source = ttk.Frame(self.single_tab, padding=8)
         source.pack(fill='x')
-        ttk.Button(source, text='Открыть Bruker…', command=self.open_bruker).pack(side='left', padx=3)
-        ttk.Button(source, text='Открыть NPZ…', command=self.open_npz).pack(side='left', padx=3)
+        ttk.Button(source, text='Открыть pdata…' if self.source_mode == 'pdata' else 'Открыть Bruker…',
+                   command=self.open_bruker).pack(side='left', padx=3)
+        if self.source_mode == 'raw':
+            ttk.Button(source, text='Открыть NPZ…', command=self.open_npz).pack(side='left', padx=3)
         ttk.Button(source, text='Демо', command=self.load_demo).pack(side='left', padx=3)
         ttk.Button(source, text='Аподизация / базовая линия…', command=self.open_preprocess).pack(side='left', padx=8)
         self.fit_button = ttk.Button(source, text='Выполнить анализ', command=self.run_analysis)
@@ -204,6 +225,9 @@ class SpintegrateApp:
         actions = ttk.Frame(self.single_tab, padding=(8, 0, 8, 6))
         actions.pack(fill='x')
         ttk.Button(actions, text='Экспорт картинки…', command=self.export_single_image).pack(side='left', padx=4)
+        alternative = 'raw' if self.source_mode == 'pdata' else 'pdata'
+        ttk.Button(actions, text='Анализировать raw…' if alternative == 'raw' else 'Анализировать pdata…',
+                   command=lambda: self.open_source_window(alternative)).pack(side='left', padx=4)
         ttk.Button(actions, text='Запомнить → серия', command=self.remember_for_batch).pack(side='right', padx=4)
         self.source_label = ttk.Label(self.single_tab, text='Спектр не загружен', foreground='#65758a')
         self.source_label.pack(fill='x', padx=12, pady=(0, 6))
@@ -237,15 +261,22 @@ class SpintegrateApp:
         add('reference_high', 'Окно референса: до', p.reference_high)
         add('ppm_offset', 'Сдвиг шкалы, ppm', p.ppm_offset)
         add('zero_fill_factor', 'Zero filling ×', p.zero_fill_factor, [1, 2, 4, 8], int)
-        add('remove_digital_filter', 'Удалить цифровой фильтр', p.remove_digital_filter, kind=bool)
-        ttk.Label(processing_tab, text='P0/P1 — старт автоматического фазирования. '
-                  '«Без коррекции» показывает реальную часть FFT.\nLB настраивается в отдельном окне.',
-                  wraplength=365, foreground='#65758a').pack(padx=8, pady=10, anchor='w')
+        if self.source_mode == 'raw':
+            add('remove_digital_filter', 'Удалить цифровой фильтр', p.remove_digital_filter, kind=bool)
+        else:
+            add('pdata_procno', 'Номер pdata (procno)', p.pdata_procno, kind=str)
+        explanation = ('P0/P1 — старт автоматического фазирования. «Без коррекции» показывает реальную часть FFT.\n'
+                       'LB настраивается в отдельном окне.' if self.source_mode == 'raw' else
+                       'По умолчанию используются 1r и ppm-шкала TopSpin. Фазы PHC0/PHC1 повторно не применяются. '
+                       'Выбранные здесь фаза, LB и zero filling — дополнительная обработка; для неё нужен канал 1i.')
+        ttk.Label(processing_tab, text=explanation, wraplength=365,
+                  foreground='#65758a').pack(padx=8, pady=10, anchor='w')
         self._build_regions(region_tab)
         self.fit_fields = FieldPanel(fit_tab, self.fit_settings_changed)
         self.fit_fields.pack(fill='x')
         f = self.session.fit
         add = self.fit_fields.add
+        add('analysis_label', 'Метод анализа', 'Деконволюция Лоренцами', tuple(ANALYSIS_LABELS), str)
         add('threshold', 'Threshold (высота пика)', f.threshold,
             hint='Абсолютная высота после локальной коррекции базовой линии.')
         add('min_separation_points', 'Разделение, точки', f.min_separation_points, kind=int)
@@ -260,17 +291,19 @@ class SpintegrateApp:
         add('loss', 'Функция ошибки', f.loss, ['linear', 'soft_l1'], str)
         add('residual_warning', 'Предупреждать при RMSE >', f.residual_warning)
         add('cancellation_warning', 'Компенсация: порог 0…1', f.cancellation_warning)
-        ttk.Label(fit_tab, text='Центры фиксированы по peak-picking.\nШирина модели = HWHM (ppm); '
+        self.fit_hint = ttk.Label(fit_tab, text='Центры фиксированы по peak-picking.\nШирина модели = HWHM (ppm); '
                   'старт = max(LB, initial FWHM) / (2 × SFO1).\nИнтеграл = Σ A × HWHM; '
                   'полная площадь Лоренца = π × этот интеграл.', wraplength=365,
-                  foreground='#65758a').pack(padx=8, pady=10, anchor='w')
+                  foreground='#65758a')
+        self.fit_hint.pack(padx=8, pady=10, anchor='w')
         self.integral_tree = ttk.Treeview(result_tab, columns=('integral',), show='tree headings', height=7)
         self.integral_tree.heading('#0', text='Сигнал')
-        self.integral_tree.heading('integral', text='Σ A × HWHM')
+        self.integral_tree.heading('integral', text='Интеграл')
         self.integral_tree.column('#0', width=145)
         self.integral_tree.column('integral', width=140)
         self.integral_tree.pack(fill='x', padx=6, pady=8)
-        ttk.Button(result_tab, text='Сохранить пики и интегралы CSV…', command=self.export_single).pack(pady=4)
+        self.export_csv_button = ttk.Button(result_tab, text='Сохранить пики и интегралы CSV…', command=self.export_single)
+        self.export_csv_button.pack(pady=4)
         ttk.Button(result_tab, text='Сохранить файл подгонки .spfit…', command=self.save_single_fit).pack(pady=4)
         frame, self.result_text = scrolled_text(result_tab, 17)
         frame.pack(fill='both', expand=True, padx=6, pady=8)
@@ -420,6 +453,9 @@ class SpintegrateApp:
         p['reference_label'] = next(k for k, v in REF_LABELS.items() if v == p['reference_mode'])
         self.processing_fields.set_values(p)
         self.fit_fields.set_values(asdict(self.session.fit))
+        self.fit_fields.set_values({'analysis_label': next(k for k, v in ANALYSIS_LABELS.items()
+                                                         if v == self.session.analysis_method)})
+        self.update_analysis_controls()
         self.loading_settings = False
         self.refresh_regions()
         if self.language != self.session.appearance.language:
@@ -478,8 +514,12 @@ class SpintegrateApp:
         p['reference_mode'] = REF_LABELS[canonical(p.pop('reference_label'))]
         for k, v in p.items():
             setattr(s.processing, k, v)
-        for k, v in self.fit_fields.values().items():
-            setattr(s.fit, k, v)
+        s.processing.source_mode = self.source_mode
+        s.analysis_method = ANALYSIS_LABELS[canonical(self.fit_fields.vars['analysis_label'].get())]
+        if s.analysis_method == 'lorentzian':
+            for k, v in self.fit_fields.values().items():
+                if k != 'analysis_label':
+                    setattr(s.fit, k, v)
         s.validate()
         return s
 
@@ -501,8 +541,47 @@ class SpintegrateApp:
     def fit_settings_changed(self):
         if self.loading_settings:
             return
+        self.update_analysis_controls()
         self.invalidate()
         self.schedule_preview()
+
+    def update_analysis_controls(self):
+        mode = ANALYSIS_LABELS[canonical(self.fit_fields.vars['analysis_label'].get())]
+        self.session.analysis_method = mode
+        for key in self.fit_fields.vars:
+            if key != 'analysis_label':
+                self.fit_fields.enable(key, mode == 'lorentzian')
+        if hasattr(self, 'fit_hint'):
+            if mode == 'direct':
+                text = ('Прямой интеграл = ∫ I(ppm) dppm после локальной коррекции базовой линии. '
+                        'Поиск пиков и подгонка не выполняются. Отрицательные сигналы дают отрицательный вклад.')
+            else:
+                text = ('Центры фиксированы по peak-picking.\nШирина модели = HWHM (ppm); '
+                        'старт = max(LB, initial FWHM) / (2 × SFO1).\nИнтеграл = Σ A × HWHM; '
+                        'полная площадь Лоренца = π × этот интеграл.')
+            set_label(self.fit_hint, text)
+            set_label(self.export_csv_button, 'Сохранить интегралы CSV…' if mode == 'direct'
+                      else 'Сохранить пики и интегралы CSV…')
+            heading = 'Интеграл (инт. × ppm)' if mode == 'direct' else 'Σ A × HWHM'
+            self.integral_tree._source_headings = {**getattr(self.integral_tree, '_source_headings', {}),
+                                                    'integral': heading}
+            self.integral_tree.heading('integral', text=self.t(heading))
+
+    def open_source_window(self, source_mode):
+        owner = self
+        while owner.parent_app is not None:
+            owner = owner.parent_app
+        for app in [owner, *owner.source_windows]:
+            if app.source_mode == source_mode and not app.closed:
+                app.root.deiconify()
+                app.root.lift()
+                return app
+        window = tk.Toplevel(owner.root)
+        app = SpintegrateApp(window, source_mode=source_mode, parent_app=owner)
+        app.session.appearance = copy.deepcopy(self.session.appearance)
+        app.set_language(self.language)
+        owner.source_windows.append(app)
+        return app
 
     def schedule_preview(self):
         if self.preview_timer:
@@ -514,6 +593,8 @@ class SpintegrateApp:
         self.jobs[name] = (future, callback, generation)
 
     def _poll(self):
+        if self.closed:
+            return
         for name, (future, callback, generation) in list(self.jobs.items()):
             if not future.done():
                 continue
@@ -543,14 +624,16 @@ class SpintegrateApp:
             task = self.pending_preview
             self.pending_preview = None
             self._submit_preview(*task)
-        self.root.after(80, self._poll)
+        self.poll_timer = self.root.after(80, self._poll)
 
     def error(self, text):
         self.status.set('Ошибка: ' + text)
         messagebox.showerror('Spintegrate', self.t(text), parent=self.root)
 
     def open_bruker(self):
-        path = self.dialog(filedialog.askdirectory, title='Папка эксперимента с fid и acqus')
+        path = self.dialog(filedialog.askdirectory,
+                           title='Папка pdata с 1r и procs или папка эксперимента' if self.source_mode == 'pdata'
+                           else 'Папка эксперимента с fid и acqus')
         if path:
             self.load_path(path)
 
@@ -564,26 +647,45 @@ class SpintegrateApp:
             recipe = self.read_settings()
         except ValueError as exc:
             return self.error(str(exc))
+        if self.source_mode == 'pdata':
+            selected = Path(path)
+            if selected.is_file():
+                selected = selected.parent
+            if selected.parent.name.lower() == 'pdata' and selected.name.isdigit():
+                self.loading_settings = True
+                self.processing_fields.vars['pdata_procno'].set(selected.name)
+                self.loading_settings = False
+                recipe.processing.pdata_procno = selected.name
         self.invalidate()
         self.source_path = str(path)
         self.raw = self.spectrum = None
         self.pending_preview = None
-        self.status.set('Загрузка FID…')
+        self.status.set('Загрузка pdata…' if self.source_mode == 'pdata' else 'Загрузка FID…')
         remove_filter = recipe.processing.remove_digital_filter
         def loaded(raw):
             self.raw = raw
             self.loaded_filter = remove_filter
+            self.loaded_procno = str(recipe.processing.pdata_procno)
             set_label(self.source_label, raw.source)
             self.preview()
-        self.submit('load', lambda: load_raw(path, remove_filter), loaded, self.generation)
+        self.submit('load', lambda: load_source(path, recipe.processing), loaded, self.generation)
 
     def load_demo(self):
         appearance = copy.deepcopy(self.session.appearance)
+        method = self.session.analysis_method
         self.session = demo_session()
         self.session.appearance = appearance
+        self.session.analysis_method = method
+        self.session.processing.source_mode = self.source_mode
         self._sync_widgets()
         self.invalidate()
         self.raw = demo_raw()
+        if self.source_mode == 'pdata':
+            self.session.processing.lb_hz = 0.
+            self.raw = process(self.raw, ProcessingSettings(lb_hz=0.))
+            self.raw.source_type = 'pdata'
+            self.raw.processing_metadata = {'has_imaginary': True, 'has_imag': True, 'imported_phases': [0., 0.]}
+            self._sync_widgets()
         self.source_path = None
         set_label(self.source_label, self.raw.source)
         self.selected_region = self.session.regions[0].name
@@ -599,8 +701,10 @@ class SpintegrateApp:
         except ValueError as exc:
             self.status.set(str(exc))
             return
-        if self.source_path and recipe.processing.remove_digital_filter != self.loaded_filter:
+        if self.source_mode == 'raw' and self.source_path and recipe.processing.remove_digital_filter != self.loaded_filter:
             return self.load_path(self.source_path)
+        if self.source_mode == 'pdata' and self.source_path and str(recipe.processing.pdata_procno) != self.loaded_procno:
+            return self.load_path(self.input_path(recipe.processing))
         self.preview_revision += 1
         task = (self.raw, recipe, self.generation, self.preview_revision)
         if 'preview' in self.jobs:
@@ -615,10 +719,15 @@ class SpintegrateApp:
             spectrum = process(raw, recipe.processing)
             local = None
             if selected:
-                mask = (spectrum.ppm >= selected.low) & (spectrum.ppm <= selected.high)
-                x, y = spectrum.ppm[mask], spectrum.intensity[mask]
-                corrected, baseline, notes = baseline_correct(x, y, selected.baseline)
-                peaks = pick_peaks(x, corrected, recipe.fit)
+                if recipe.analysis_method == 'direct':
+                    result = direct_region(spectrum, selected)
+                    x, y, corrected, baseline, notes = result.x, result.raw, result.corrected, result.baseline, result.notes
+                    peaks = ([], [])
+                else:
+                    mask = (spectrum.ppm >= selected.low) & (spectrum.ppm <= selected.high)
+                    x, y = spectrum.ppm[mask], spectrum.intensity[mask]
+                    corrected, baseline, notes = baseline_correct(x, y, selected.baseline)
+                    peaks = pick_peaks(x, corrected, recipe.fit)
                 local = (x, y, corrected, baseline, peaks, notes)
             return spectrum, local
         def ready(result):
@@ -626,6 +735,7 @@ class SpintegrateApp:
                 return
             self.session.processing = recipe.processing
             self.session.fit = recipe.fit
+            self.session.analysis_method = recipe.analysis_method
             self.spectrum, local = result
             self.preview_local = local
             self.draw(local=local)
@@ -635,6 +745,15 @@ class SpintegrateApp:
             if self.preprocess_window and self.preprocess_window.window.winfo_exists():
                 self.preprocess_window.refresh()
         self.submit('preview', work, ready, generation)
+
+    def input_path(self, settings):
+        path = Path(self.source_path)
+        if self.source_mode == 'pdata':
+            if path.is_file():
+                path = path.parent
+            if path.parent.name.lower() == 'pdata':
+                path = path.parent / str(settings.pdata_procno)
+        return str(path)
 
     def _draw_empty(self):
         for ax, title in ((self.overview_ax, 'Весь спектр'), (self.detail_ax, 'Выбранная область'),
@@ -833,12 +952,15 @@ class SpintegrateApp:
         self.session = recipe
         self.invalidate()
         self.fit_button.configure(state='disabled')
-        self.status.set('Подгонка областей… Интерфейс доступен; изменение параметров отменит показ старого результата.')
+        self.status.set('Интегрирование областей…' if recipe.analysis_method == 'direct' else
+                        'Подгонка областей… Интерфейс доступен; изменение параметров отменит показ старого результата.')
         raw = self.raw
         path = self.source_path
-        reload = path and self.loaded_filter != recipe.processing.remove_digital_filter
+        reload = bool(path and ((self.source_mode == 'raw' and self.loaded_filter != recipe.processing.remove_digital_filter)
+                      or (self.source_mode == 'pdata' and str(recipe.processing.pdata_procno) != self.loaded_procno)))
+        selected_path = self.input_path(recipe.processing) if reload else path
         def work():
-            source = load_raw(path, recipe.processing.remove_digital_filter) if reload else raw
+            source = load_source(selected_path, recipe.processing) if reload else raw
             return analyze(process(source, recipe.processing), recipe)
         self.submit('fit', work, self.analysis_ready, self.generation)
 
@@ -848,9 +970,15 @@ class SpintegrateApp:
         self.fit_button.configure(state='normal')
         for name, value in analysis.integrals.items():
             self.integral_tree.insert('', 'end', text=name, values=(f'{value:.9g}',))
-        lines = [f'Статус: {analysis.status}', f'P0/P1: {analysis.spectrum.phases}', '']
+        method = next(k for k, v in ANALYSIS_LABELS.items() if v == analysis.method)
+        lines = [f'Статус: {analysis.status}', 'Режим анализа: ' + method,
+                 f'P0/P1: {analysis.spectrum.phases}', '']
         for name, result in analysis.results.items():
             d = result.diagnostics
+            if analysis.method == 'direct':
+                lines.append(f'{name}: прямое интегрирование, точек {len(result.x)}')
+                lines.append('Единицы: интенсивность × ppm; численный интеграл по точным границам.')
+                continue
             lines.append(f"{name}: {len(result.centers)} пиков; сошлось={result.success}")
             lines.append(f"RMSE={d.get('relative_rmse')}; nfev={d.get('nfev')}; condition={d.get('condition_number')}")
             lines.append(' №     ppm (фикс.)   A            HWHM ppm     A×HWHM')
@@ -884,14 +1012,22 @@ class SpintegrateApp:
         if not path:
             return
         try:
-            self.session = Session.load(path)
-            self._sync_widgets()
-            self.invalidate()
-            self.batch_recipe = copy.deepcopy(self.session)
-            self._recipe_description()
-            self.preview()
+            loaded = Session.load(path)
+            if loaded.processing.source_mode != self.source_mode:
+                destination = self.open_source_window(loaded.processing.source_mode)
+                destination.apply_recipe(loaded)
+                return
+            self.apply_recipe(loaded)
         except Exception as exc:
             self.error(str(exc))
+
+    def apply_recipe(self, loaded):
+        self.session = loaded
+        self._sync_widgets()
+        self.invalidate()
+        self.batch_recipe = copy.deepcopy(self.session)
+        self._recipe_description()
+        self.preview()
 
     def remember_for_batch(self):
         try:
@@ -907,34 +1043,46 @@ class SpintegrateApp:
 
     def _recipe_description(self):
         s = self.batch_recipe
-        set_label(self.recipe_label, f'Запомнено: {len(s.regions)} областей обработки, '
+        intro = f'Источник спектра: {s.processing.source_mode}\nРежим анализа: '
+        intro += next(k for k, v in ANALYSIS_LABELS.items() if v == s.analysis_method) + '\n'
+        if s.processing.source_mode == 'pdata':
+            intro += f'pdata/{s.processing.pdata_procno}\n'
+        text = (f'Запомнено: {len(s.regions)} областей обработки, '
                  f'{len(s.integrals)} интегралов; фаза={s.processing.phase}; '
                  f'LB={s.processing.lb_hz:g} Гц; threshold={s.fit.threshold:g}. '
-                 'Центры и амплитуды определяются заново в каждом спектре.')
+                 'Центры и амплитуды определяются заново в каждом спектре.' if s.analysis_method == 'lorentzian' else
+                 f'Сохранено областей интегрирования: {len(s.integrals)}. Численный интеграл: интенсивность × ppm.')
+        set_label(self.recipe_label, intro + text)
 
     def export_single(self):
         if self.analysis is None:
             return self.error('Сначала выполните анализ с текущими параметрами.')
-        path = self.dialog(filedialog.asksaveasfilename, defaultextension='.csv', initialfile='spectrum.peaks.csv')
+        direct = self.analysis.method == 'direct'
+        path = self.dialog(filedialog.asksaveasfilename, defaultextension='.csv',
+                           initialfile='spectrum.integrals.csv' if direct else 'spectrum.peaks.csv')
         if not path:
             return
         try:
-            with Path(path).open('w', encoding='utf-8-sig', newline='') as stream:
-                writer = csv.writer(stream)
-                writer.writerow(['region', 'peak', 'center_ppm_fixed', 'initial_amplitude',
-                                 'amplitude', 'hwhm_ppm', 'fwhm_hz', 'amplitude_x_hwhm', 'converged'])
-                for name, result in self.analysis.results.items():
-                    for i, (c, a0, a, w) in enumerate(zip(result.centers, result.initial_amplitudes,
-                                                        result.amplitudes, result.widths), 1):
-                        writer.writerow([name, i, c, a0, a, w, 2*w*self.spectrum.sf_mhz, a*w, result.success])
-            integral_path = Path(path).with_suffix('.integrals.csv')
+            if not direct:
+                with Path(path).open('w', encoding='utf-8-sig', newline='') as stream:
+                    writer = csv.writer(stream)
+                    writer.writerow(['region', 'peak', 'center_ppm_fixed', 'initial_amplitude',
+                                     'amplitude', 'hwhm_ppm', 'fwhm_hz', 'amplitude_x_hwhm', 'converged'])
+                    for name, result in self.analysis.results.items():
+                        for i, (c, a0, a, w) in enumerate(zip(result.centers, result.initial_amplitudes,
+                                                            result.amplitudes, result.widths), 1):
+                            writer.writerow([name, i, c, a0, a, w, 2*w*self.spectrum.sf_mhz, a*w, result.success])
+            integral_path = Path(path) if direct else Path(path).with_suffix('.integrals.csv')
             source = Path(self.analysis.spectrum.source)
-            row = dict(spectrum_number=source.stem if source.is_file() else source.name,
-                       spectrum_id=source.name)
+            experiment = source.parent.parent if self.analysis.spectrum.source_type == 'pdata' and source.parent.name.lower() == 'pdata' else source
+            row = dict(spectrum_number=experiment.stem if experiment.is_file() else experiment.name,
+                       spectrum_id=source.relative_to(experiment.parent).as_posix()
+                       if self.analysis.spectrum.source_type == 'pdata' else source.name)
             row.update({f'integral__{n}': v for n, v in self.analysis.integrals.items()})
             write_batch_csv(integral_path, [row], self.session)
             self.session.save(Path(path).with_suffix('.settings.json'))
-            self.status.set('Сохранены CSV пиков, CSV интегралов и JSON настроек: ' + path)
+            self.status.set(('Сохранены CSV интегралов и JSON настроек: ' if direct else
+                             'Сохранены CSV пиков, CSV интегралов и JSON настроек: ') + path)
         except Exception as exc:
             self.error(str(exc))
 
@@ -963,7 +1111,9 @@ class SpintegrateApp:
 
     def show_batch_paths(self):
         try:
-            paths = discover_spectra(self.batch_root.get(), self.batch_recursive.get())
+            recipe = self.batch_recipe or self.read_settings()
+            paths = discover_spectra(self.batch_root.get(), self.batch_recursive.get(),
+                                     recipe.processing.source_mode, recipe.processing.pdata_procno)
             set_text(self.batch_text, f'Найдено {len(paths)} спектров:\n' + '\n'.join(map(str, paths)))
         except Exception as exc:
             self.error(str(exc))
@@ -972,15 +1122,23 @@ class SpintegrateApp:
         directory = self.dialog(filedialog.askdirectory, title='Папка для синтетической демо-серии')
         if directory:
             try:
-                target = Path(directory) / 'spintegrate_demo'
-                if any((target / f'{n}.npz').exists() for n in range(1, 5)):
+                target = Path(directory) / ('spintegrate_pdata_demo' if self.source_mode == 'pdata' else 'spintegrate_demo')
+                if target.exists() and any(target.iterdir()):
                     raise ValueError('Демо-файлы уже существуют. Выберите другую папку.')
-                write_demo_series(target)
+                recipe = demo_session()
+                recipe.processing.source_mode = self.source_mode
+                recipe.analysis_method = self.session.analysis_method
+                if self.source_mode == 'pdata':
+                    recipe.processing.pdata_procno = self.read_settings().processing.pdata_procno
+                    write_pdata_demo_series(target, recipe.processing.pdata_procno)
+                else:
+                    write_demo_series(target)
                 self.batch_root.set(str(target))
                 self.batch_output.set(str(target / 'integrals.csv'))
-                self.batch_recipe = demo_session()
+                self.batch_recipe = recipe
                 self._recipe_description()
-                self.status.set('Создана синтетическая серия из четырёх FID.')
+                self.status.set('Создана синтетическая серия из четырёх pdata.' if self.source_mode == 'pdata'
+                                else 'Создана синтетическая серия из четырёх FID.')
             except Exception as exc:
                 self.error(str(exc))
 
@@ -995,7 +1153,8 @@ class SpintegrateApp:
             recipe = copy.deepcopy(self.batch_recipe)
             recipe.validate(require_regions=True)
             root = self.batch_root.get()
-            paths = discover_spectra(root, self.batch_recursive.get())
+            paths = discover_spectra(root, self.batch_recursive.get(), recipe.processing.source_mode,
+                                     recipe.processing.pdata_procno)
             if not paths:
                 raise ValueError('Спектры не найдены.')
             out = Path(self.batch_output.get())
@@ -1117,7 +1276,7 @@ class SpintegrateApp:
                               'Откройте сохранённый .spfit или верните исходный FID для старой серии.')
         self.status.set('Для этой серии нет сохранённого фита. Повторный расчёт по её сохранённым настройкам…')
         def work():
-            raw = load_raw(source, recipe.processing.remove_digital_filter)
+            raw = load_source(source, recipe.processing)
             return analyze(process(raw, recipe.processing), recipe)
         def ready(analysis):
             self._show_fit_review(analysis, recipe, 'ПОВТОРНЫЙ РАСЧЁТ из исходного спектра: ' + source)
@@ -1146,13 +1305,26 @@ class SpintegrateApp:
             self.preprocess_window = PreprocessWindow(self)
 
     def close(self):
+        if self.closed:
+            return True
         if self.batch_running:
             if not self.confirm('Закрыть Spintegrate',
                     'Серия выполняется. Остановить после текущего спектра и закрыть окно?'):
-                return
+                return False
             self.batch_cancel.set()
+        for child in self.source_windows:
+            if not child.close():
+                return False
+        self.closed = True
+        if self.poll_timer:
+            self.root.after_cancel(self.poll_timer)
+        if self.preview_timer:
+            self.root.after_cancel(self.preview_timer)
+        if self.preprocess_window and self.preprocess_window.window.winfo_exists():
+            self.preprocess_window.close()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
+        return True
 
 
 class FitReviewWindow:
@@ -1162,7 +1334,8 @@ class FitReviewWindow:
         self.recipe = copy.deepcopy(recipe)
         self.origin = origin
         self.window = tk.Toplevel(app.root)
-        self.window.title('Проверка фита Лоренцами — ' + Path(analysis.spectrum.source).name)
+        self.window.title(('Проверка интегрирования — ' if analysis.method == 'direct' else
+                           'Проверка фита Лоренцами — ') + Path(analysis.spectrum.source).name)
         self.window.geometry('1170x900')
         self.window.minsize(950, 700)
         ttk.Label(self.window, text=origin, wraplength=1100, padding=(10, 6),
@@ -1213,14 +1386,17 @@ class FitReviewWindow:
         for area in self.recipe.integrals:
             if area.parent == name:
                 value = self.analysis.integrals.get(area.name, float('nan'))
-                lines.append(f'Интеграл {area.name}: {value:.9g} (Σ A × HWHM)')
+                units = 'интенсивность × ppm' if self.analysis.method == 'direct' else 'Σ A × HWHM'
+                lines.append(f'Интеграл {area.name}: {value:.9g} ({units})')
         result = self.analysis.results.get(name)
-        if result:
+        if result and self.analysis.method == 'lorentzian':
             d = result.diagnostics
             lines.append(f"RMSE: {d.get('relative_rmse')}; сошлось: {result.success}; nfev: {d.get('nfev')}")
             lines.append(' №       ppm (фикс.)       A            HWHM ppm        A×HWHM')
             for i, (c, a, w) in enumerate(zip(result.centers, result.amplitudes, result.widths), 1):
                 lines.append(f'{i:3}  {c:14.7f} {a:14.6g} {w:14.6g} {a*w:14.6g}')
+        elif result:
+            lines.append('Прямое интегрирование: поиск пиков и оптимизация не используются.')
         if name in self.analysis.errors:
             lines.append('ОШИБКА: ' + self.analysis.errors[name])
         lines.extend(self.analysis.notes)
@@ -1255,7 +1431,9 @@ class ImageExportWindow:
         a = app.session.appearance
         add = self.fields.add
         self.language_choices = {'Как в программе': 'auto', 'Русский': 'ru', 'English': 'en'}
-        self.layout_choices = {'Весь спектр + область + остаток': 'full', 'Область + остаток': 'fit', 'Только область': 'region'}
+        self.layout_choices = ({'Весь спектр + область + интеграл': 'full', 'Область + интеграл': 'fit', 'Только область': 'region'}
+                               if analysis.method == 'direct' else
+                               {'Весь спектр + область + остаток': 'full', 'Область + остаток': 'fit', 'Только область': 'region'})
         add('export_format', 'Формат', a.export_format, ('png', 'tiff', 'svg'), str)
         add('export_dpi', 'Качество, DPI', a.export_dpi, kind=int,
             hint='150 / 300 / 600 / 1200 DPI')

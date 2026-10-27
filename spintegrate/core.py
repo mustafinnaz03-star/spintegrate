@@ -51,6 +51,8 @@ class ProcessingSettings:
     ppm_offset: float = 0.0
     zero_fill_factor: int = 1
     remove_digital_filter: bool = True
+    source_mode: str = 'raw'
+    pdata_procno: str = '1'
 
 
 @dataclass
@@ -95,10 +97,17 @@ class Session:
     integrals: list[IntegrationRegion] = field(default_factory=list)
     appearance: AppearanceSettings = field(default_factory=AppearanceSettings)
     schema_version: int = 1
+    analysis_method: str = 'lorentzian'
 
     def validate(self, require_regions: bool = False):
         validate_appearance(self.appearance)
         p, f = self.processing, self.fit
+        if self.analysis_method not in ('lorentzian', 'direct'):
+            raise ValueError('Неизвестный метод анализа: lorentzian или direct.')
+        if p.source_mode not in ('raw', 'pdata'):
+            raise ValueError('Источник спектра должен быть raw или pdata.')
+        if p.source_mode == 'pdata' and (not str(p.pdata_procno).isdigit() or int(p.pdata_procno) < 1):
+            raise ValueError('Номер обработки pdata должен быть положительным целым числом.')
         if p.phase not in PHASE_MODES or p.abs_source not in ('fid', 'spectrum'):
             raise ValueError('Неизвестный режим фазирования/abs.')
         if p.reference_mode not in ('metadata', 'strongest', 'window'):
@@ -111,16 +120,17 @@ class Session:
             raise ValueError('Окно peak_minima должно быть положительным.')
         if p.reference_mode == 'window' and p.reference_low >= p.reference_high:
             raise ValueError('Неверное окно референса.')
-        if not (np.isfinite(f.threshold) and f.threshold > 0):
-            raise ValueError('Threshold должен быть положительным.')
-        if not (0 < f.min_width_hz < f.max_width_hz) or f.initial_width_hz <= 0:
-            raise ValueError('Ширины: 0 < min < max; initial > 0.')
-        if f.max_nfev < 1 or f.restarts < 1 or f.max_peaks < 1 or f.min_separation_points < 1:
-            raise ValueError('Лимиты оптимизации и число точек должны быть >= 1.')
-        if f.loss not in ('linear', 'soft_l1'):
-            raise ValueError('Loss: linear или soft_l1.')
-        if not 0 < f.cancellation_warning < 1 or f.residual_warning <= 0:
-            raise ValueError('Неверные пороги диагностики.')
+        if self.analysis_method == 'lorentzian':
+            if not (np.isfinite(f.threshold) and f.threshold > 0):
+                raise ValueError('Threshold должен быть положительным.')
+            if not (0 < f.min_width_hz < f.max_width_hz) or f.initial_width_hz <= 0:
+                raise ValueError('Ширины: 0 < min < max; initial > 0.')
+            if f.max_nfev < 1 or f.restarts < 1 or f.max_peaks < 1 or f.min_separation_points < 1:
+                raise ValueError('Лимиты оптимизации и число точек должны быть >= 1.')
+            if f.loss not in ('linear', 'soft_l1'):
+                raise ValueError('Loss: linear или soft_l1.')
+            if not 0 < f.cancellation_warning < 1 or f.residual_warning <= 0:
+                raise ValueError('Неверные пороги диагностики.')
         if require_regions and (not self.regions or not self.integrals):
             raise ValueError('Сохраните области обработки и интегрирования.')
         names = [r.name for r in self.regions]
@@ -144,8 +154,9 @@ class Session:
                     or not parent.low <= r.low < r.high <= parent.high):
                 raise ValueError(f'{r.name}: область интегрирования должна лежать внутри {r.parent}.')
         validate_baseline(self.baseline_default)
-        numeric = [p.p0, p.p1, p.reference_ppm, p.reference_low, p.reference_high,
-                   p.ppm_offset, f.initial_width_hz, f.min_width_hz, f.max_width_hz]
+        numeric = [p.p0, p.p1, p.reference_ppm, p.reference_low, p.reference_high, p.ppm_offset]
+        if self.analysis_method == 'lorentzian':
+            numeric += [f.initial_width_hz, f.min_width_hz, f.max_width_hz]
         if not np.isfinite(numeric).all():
             raise ValueError('Настройки должны содержать конечные числа.')
 
@@ -165,6 +176,7 @@ class Session:
             processing=ProcessingSettings(**d['processing']), fit=FitSettings(**d['fit']),
             baseline_default=BaselineSettings(**d['baseline_default']),
             appearance=AppearanceSettings(**d.get('appearance', {})),
+            analysis_method=d.get('analysis_method', 'lorentzian'),
             regions=[FitRegion(**{**r, 'baseline': BaselineSettings(**r['baseline'])}) for r in d['regions']],
             integrals=[IntegrationRegion(**r) for r in d['integrals']])
         session.validate()
@@ -200,6 +212,8 @@ class Spectrum:
     source: str
     phases: tuple[float, float]
     notes: list[str]
+    source_type: str = 'raw'
+    processing_metadata: dict = field(default_factory=dict)
 
 
 def load_raw(path, remove_digital_filter=True) -> RawSpectrum:
@@ -233,8 +247,29 @@ def load_raw(path, remove_digital_filter=True) -> RawSpectrum:
     return RawSpectrum(fid, sf, sw, carrier, str(path), notes)
 
 
-def process(raw: RawSpectrum, p: ProcessingSettings) -> Spectrum:
+def resolve_pdata_path(path, procno='1'):
+    from .pdata import resolve_pdata_path as resolve
+    return resolve(path, procno)
+
+
+def load_pdata(path, procno='1') -> Spectrum:
+    from .pdata import load_pdata as load
+    return load(path, procno)
+
+
+def load_source(path, p: ProcessingSettings):
+    if p.source_mode == 'pdata':
+        return load_pdata(path, p.pdata_procno)
+    if p.source_mode == 'raw':
+        return load_raw(path, p.remove_digital_filter)
+    raise ValueError('Источник спектра должен быть raw или pdata.')
+
+
+def process(raw: RawSpectrum | Spectrum, p: ProcessingSettings) -> Spectrum:
     Session(processing=p).validate()
+    if isinstance(raw, Spectrum):
+        from .pdata import process_pdata
+        return process_pdata(raw, p)
     fid = raw.fid.copy()
     if p.phase == 'abs' and p.abs_source == 'fid':
         fid = np.abs(fid).astype(complex)
@@ -503,6 +538,46 @@ class Analysis:
     errors: dict[str, str]
     status: str
     notes: list[str]
+    method: str = 'lorentzian'
+
+
+def integration_segment(x, y, low, high):
+    """Extract a linear-interpolated interval including its exact endpoints."""
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    if (x.ndim != 1 or y.ndim != 1 or len(x) != len(y) or len(x) < 2
+            or not np.isfinite(x).all() or not np.isfinite(y).all()):
+        raise ValueError('Для интегрирования нужны конечные одномерные массивы одинаковой длины.')
+    differences = np.diff(x)
+    if np.all(differences < 0):
+        x, y = x[::-1], y[::-1]
+    elif not np.all(differences > 0):
+        raise ValueError('Шкала интегрирования должна быть строго монотонной без повторов.')
+    low, high = float(low), float(high)
+    if not np.isfinite([low, high]).all() or low >= high:
+        raise ValueError('Для интегрирования нужны две различные границы low < high.')
+    if low < x[0] or high > x[-1]:
+        raise ValueError('Область интегрирования выходит за диапазон спектра.')
+    inner = (x > low) & (x < high)
+    return np.r_[low, x[inner], high], np.r_[np.interp(low, x, y), y[inner], np.interp(high, x, y)]
+
+
+def integrate_region(x, y, low, high):
+    """Signed trapezoidal area in intensity*ppm, independent of ppm direction."""
+    xx, yy = integration_segment(x, y, low, high)
+    return float(np.trapezoid(yy, xx))
+
+
+def direct_region(spectrum: Spectrum, region: FitRegion) -> FitResult:
+    x, y = integration_segment(spectrum.ppm, spectrum.intensity, region.low, region.high)
+    if region.baseline.method == 'none':
+        corrected, line, notes = y.copy(), np.zeros_like(y), []
+    else:
+        corrected, line, notes = baseline_correct(x, y, region.baseline)
+    empty = np.array([], dtype=float)
+    return FitResult(region.name, x, y, line, corrected, empty.copy(), empty.copy(),
+                     empty.copy(), empty.copy(), corrected.copy(), True, notes,
+                     dict(method='direct', n_peaks=0, nfev=0, relative_rmse=None,
+                          integral_units='intensity*ppm'))
 
 
 def analyze(spectrum: Spectrum, session: Session) -> Analysis:
@@ -511,7 +586,8 @@ def analyze(spectrum: Spectrum, session: Session) -> Analysis:
     notes = list(spectrum.notes)
     for region in session.regions:
         try:
-            result = fit_region(spectrum, region, session)
+            result = (direct_region(spectrum, region) if session.analysis_method == 'direct'
+                      else fit_region(spectrum, region, session))
             results[region.name] = result
             notes.extend(f'{region.name}: {n}' for n in result.notes)
             if not result.success:
@@ -525,24 +601,47 @@ def analyze(spectrum: Spectrum, session: Session) -> Analysis:
         if result is None or area.parent in errors:
             integrals[area.name] = float('nan')
         else:
-            keep = (result.centers >= area.low) & (result.centers <= area.high)
-            integrals[area.name] = float(np.sum(result.amplitudes[keep] * result.widths[keep]))
+            if session.analysis_method == 'direct':
+                integrals[area.name] = integrate_region(result.x, result.corrected, area.low, area.high)
+            else:
+                keep = (result.centers >= area.low) & (result.centers <= area.high)
+                integrals[area.name] = float(np.sum(result.amplitudes[keep] * result.widths[keep]))
     return Analysis(spectrum, results, integrals, errors,
-                    'error' if errors else 'warning' if notes else 'ok', notes)
+                    'error' if errors else 'warning' if notes else 'ok', notes, session.analysis_method)
 
 
-def discover_spectra(root, recursive=True):
+def discover_spectra(root, recursive=True, source_mode='raw', pdata_procno='1'):
     root = Path(root)
     if not root.is_dir():
         raise ValueError('Выберите существующую папку серии.')
     found = set()
-    pattern = '**/fid' if recursive else '*/fid'
-    for fid in root.glob(pattern):
-        if (fid.parent / 'acqus').is_file():
-            found.add(fid.parent)
-    if (root / 'fid').is_file() and (root / 'acqus').is_file():
-        found.add(root)
-    found.update(root.glob('**/*.npz' if recursive else '*.npz'))
+    if source_mode == 'pdata':
+        procno = str(pdata_procno)
+        if not procno.isdigit() or int(procno) < 1:
+            raise ValueError('Номер обработки pdata должен быть положительным целым числом.')
+        # A directly chosen processed directory is unambiguous, even if its
+        # processing number differs from the dataset default.
+        if (root / '1r').is_file() and (root / 'procs').is_file():
+            found.add(root)
+        elif root.name.lower() == 'pdata':
+            candidate = root / procno
+            if (candidate / '1r').is_file() and (candidate / 'procs').is_file():
+                found.add(candidate)
+        else:
+            candidates = [root / 'pdata' / procno]
+            candidates.extend(root.glob(f'**/pdata/{procno}' if recursive else f'*/pdata/{procno}'))
+            found.update(candidate for candidate in candidates
+                         if (candidate / '1r').is_file() and (candidate / 'procs').is_file())
+    elif source_mode == 'raw':
+        pattern = '**/fid' if recursive else '*/fid'
+        for fid in root.glob(pattern):
+            if (fid.parent / 'acqus').is_file():
+                found.add(fid.parent)
+        if (root / 'fid').is_file() and (root / 'acqus').is_file():
+            found.add(root)
+        found.update(root.glob('**/*.npz' if recursive else '*.npz'))
+    else:
+        raise ValueError('Источник спектра должен быть raw или pdata.')
     def key(path):
         # Natural sorting, preserving unique relative paths as spectrum IDs.
         import re
@@ -581,9 +680,10 @@ def save_analysis(path, analysis: Analysis, session: Session):
     s = analysis.spectrum
     metadata = dict(format='spintegrate-fit', version=1, session=asdict(session),
                     spectrum=dict(sf_mhz=s.sf_mhz, sw_hz=s.sw_hz, source=s.source,
-                                  phases=s.phases, notes=s.notes),
+                                  phases=s.phases, notes=s.notes, source_type=s.source_type,
+                                  processing_metadata=s.processing_metadata),
                     integrals=analysis.integrals, errors=analysis.errors,
-                    status=analysis.status, notes=analysis.notes, regions=[])
+                    status=analysis.status, notes=analysis.notes, method=analysis.method, regions=[])
     arrays = dict(spectrum_ppm=s.ppm, spectrum_intensity=s.intensity,
                   spectrum_complex=s.complex_spectrum)
     for index, (name, result) in enumerate(analysis.results.items()):
@@ -620,7 +720,8 @@ def load_analysis(path):
             if len(ppm) < 2 or len(y) != len(ppm) or len(ft) != len(ppm) or not np.all(np.diff(ppm) > 0):
                 raise ValueError('Повреждена шкала спектра в файле подгонки.')
             spectrum = Spectrum(ppm, y, ft, data['sf_mhz'], data['sw_hz'],
-                                data['source'], tuple(data['phases']), data['notes'])
+                                data['source'], tuple(data['phases']), data['notes'],
+                                data.get('source_type', 'raw'), data.get('processing_metadata', {}))
             results = {}
             region_names = {r.name for r in session.regions}
             for entry in metadata['regions']:
@@ -630,7 +731,8 @@ def load_analysis(path):
                 attrs = {attr: array(f'{key}_{attr}') for attr in
                          ('x', 'raw', 'baseline', 'corrected', 'centers', 'initial_amplitudes',
                           'amplitudes', 'widths', 'fitted')}
-                if (len(attrs['x']) < 8 or not np.all(np.diff(attrs['x']) > 0)
+                minimum = 2 if entry.get('diagnostics', {}).get('method') == 'direct' else 8
+                if (len(attrs['x']) < minimum or not np.all(np.diff(attrs['x']) > 0)
                         or any(len(attrs[a]) != len(attrs['x']) for a in ('raw', 'baseline', 'corrected', 'fitted'))
                         or any(len(attrs[a]) != len(attrs['centers']) for a in ('initial_amplitudes', 'amplitudes', 'widths'))
                         or np.any(attrs['widths'] <= 0)):
@@ -640,7 +742,8 @@ def load_analysis(path):
             integrals = {name: float('nan') if v is None else float(v)
                          for name, v in metadata['integrals'].items()}
             analysis = Analysis(spectrum, results, integrals, metadata['errors'],
-                                metadata['status'], metadata['notes'])
+                                metadata['status'], metadata['notes'],
+                                metadata.get('method', session.analysis_method))
             return analysis, session
     except (KeyError, TypeError, OSError, json.JSONDecodeError) as exc:
         raise ValueError(f'Не удалось прочитать файл подгонки: {exc}') from exc
@@ -697,8 +800,10 @@ def load_batch_results(csv_path):
 def batch_analyze(root, session: Session, csv_path, progress: Callable | None = None,
                   cancelled: Callable | None = None, recursive=True):
     session.validate(require_regions=True)
-    paths = discover_spectra(root, recursive)
+    paths = discover_spectra(root, recursive, session.processing.source_mode, session.processing.pdata_procno)
     if not paths:
+        if session.processing.source_mode == 'pdata':
+            raise ValueError(f'Не найдены 1r/procs для обработки pdata/{session.processing.pdata_procno}.')
         raise ValueError('Не найдены папки с fid + acqus или демонстрационные .npz.')
     root = Path(root)
     csv_path = Path(csv_path)
@@ -713,14 +818,16 @@ def batch_analyze(root, session: Session, csv_path, progress: Callable | None = 
             was_cancelled = True
             break
         ident = path.relative_to(root).as_posix()
-        row = dict(sequence_index=number, spectrum_number=path.stem if path.is_file() else path.name,
+        experiment = path.parent.parent if session.processing.source_mode == 'pdata' and path.parent.name.lower() == 'pdata' else path
+        row = dict(sequence_index=number, spectrum_number=experiment.stem if experiment.is_file() else experiment.name,
                    spectrum_id=ident, source_path=str(path.resolve()), fit_file='',
+                   analysis_method=session.analysis_method, source_mode=session.processing.source_mode,
                    status='error', warnings='', phase_p0_deg='', phase_p1_deg='',
                    peak_count='', max_relative_rmse='')
         row.update({f'integral__{r.name}': float('nan') for r in session.integrals})
         details = dict(spectrum_id=ident, errors={}, diagnostics={})
         try:
-            raw = load_raw(path, session.processing.remove_digital_filter)
+            raw = load_source(path, session.processing)
             analysis = analyze(process(raw, session.processing), session)
             row.update({f'integral__{n}': v for n, v in analysis.integrals.items()})
             row.update(status=analysis.status, warnings=' | '.join(analysis.notes),
