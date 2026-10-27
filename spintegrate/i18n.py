@@ -55,6 +55,16 @@ EN = {
     'Запомнить → серия': 'Use for batch →', 'Спектр не загружен': 'No spectrum loaded',
     'Обработка': 'Processing', 'Области': 'Regions', 'Подгонка': 'Fitting', 'Результат': 'Results',
     'Фаза': 'Phase', 'Без коррекции': 'No correction',
+    'Привязать к выделенному сигналу': 'Reference to selected signal',
+    'Выделите мышью окно одного референсного сигнала. Привязка сохранит его текущую ppm и будет находить этот сигнал заново в каждом спектре серии. Режим «Из метаданных» сохраняет отдельную шкалу каждого файла.':
+        'Select one reference signal with the mouse. Referencing retains its current ppm and locates the signal anew in each batch spectrum. Metadata mode keeps each file’s own scale.',
+    'Выделите окно одного референсного сигнала на графике.': 'Select one reference signal window on the plot.',
+    'Окно референса должно содержать не менее трёх точек.': 'The reference window must contain at least three points.',
+    'Определяю референс по выбранному спектру…': 'Determining the reference from the selected spectrum…',
+    'Привязка задана. При необходимости уточните «Референс, ppm», затем нажмите «Запомнить → серия».':
+        'Reference set. Adjust Reference, ppm if needed, then click Use for batch.',
+    'Привязка серии: шкала каждого файла, без автоматического выравнивания.':
+        'Batch referencing: each file’s own scale, without automatic alignment.',
     'Повторить автофазировку': 'Recalculate automatic phase',
     'Фаза ещё не определена.': 'Phase has not been determined.',
     'Для автофазировки выберите ACME или peak_minima.': 'Choose ACME or peak_minima for automatic phasing.',
@@ -237,6 +247,8 @@ EN = {
 
 # Capture already-formatted arguments without changing user-controlled names.
 TEMPLATES = {
+    'Привязка серии: референс {ppm} ppm; режим {mode}.': 'Batch referencing: reference {ppm} ppm; mode {mode}.',
+    'Окно поиска референса: {low}…{high} ppm.': 'Reference search window: {low}…{high} ppm.',
     'Фаза P0={p0}°, P1={p1}°. Сохраняется при изменении LB.':
         'Phase P0={p0}°, P1={p1}°. Retained when LB changes.',
     'Режим анализа: {message}': 'Analysis method: {message}',

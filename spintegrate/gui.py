@@ -20,7 +20,7 @@ from .core import (BASELINE_METHODS, PHASE_MODES, BaselineSettings, FitRegion,
                    IntegrationRegion, Session, analyze, baseline_correct,
                    batch_analyze, discover_spectra, load_analysis, load_batch_results,
                    direct_region, load_source, PhaseState, ProcessingSettings, pick_peaks, process, save_analysis,
-                   validate_baseline, write_batch_csv)
+                   validate_baseline, window_reference_index, write_batch_csv)
 from .demo import demo_raw, demo_session, write_demo_series, write_pdata_demo_series
 from .plotting import draw_spectrum
 from .appearance import AREA_COLORS, AppearanceSettings, area_color, validate_appearance
@@ -270,6 +270,13 @@ class SpintegrateApp:
             add('remove_digital_filter', 'Удалить цифровой фильтр', p.remove_digital_filter, kind=bool)
         else:
             add('pdata_procno', 'Номер pdata (procno)', p.pdata_procno, kind=str)
+        ttk.Button(processing_tab, text='Привязать к выделенному сигналу',
+                   command=self.anchor_reference).pack(fill='x', padx=8, pady=5)
+        ttk.Label(processing_tab,
+                  text='Выделите мышью окно одного референсного сигнала. Привязка сохранит его текущую ppm '
+                       'и будет находить этот сигнал заново в каждом спектре серии. '
+                       'Режим «Из метаданных» сохраняет отдельную шкалу каждого файла.',
+                  wraplength=365, foreground='#65758a').pack(padx=8, pady=5, anchor='w')
         self.rephase_button = ttk.Button(processing_tab, text='Повторить автофазировку', command=self.rephase_spectrum)
         self.rephase_button.pack(fill='x', padx=8, pady=5)
         self.phase_summary = ttk.Label(processing_tab, text='Фаза ещё не определена.', wraplength=365)
@@ -580,6 +587,40 @@ class SpintegrateApp:
         self.update_analysis_controls()
         self.invalidate()
         self.schedule_preview()
+
+    def anchor_reference(self):
+        if self.raw is None:
+            return self.error('Сначала загрузите спектр.')
+        if 'anchor_reference' in self.jobs:
+            return
+        try:
+            recipe = self.read_settings()
+            low, high = sorted((float(self.bound_low.get()), float(self.bound_high.get())))
+            if not np.isfinite([low, high]).all() or low >= high:
+                raise ValueError('Выделите окно одного референсного сигнала на графике.')
+        except ValueError as exc:
+            return self.error(str(exc))
+        source, phase_state = self.raw, self.phase_state
+        def work():
+            current = process(source, recipe.processing, phase_cache=phase_state)
+            index = window_reference_index(current.ppm, current.intensity, low, high)
+            shift = current.processing_metadata['reference_shift_ppm']
+            # The search window is stored in the unreferenced input coordinates;
+            # target+offset reproduces the selected spectrum's displayed position.
+            return low-shift, high-shift, current.ppm[index]-recipe.processing.ppm_offset
+        def ready(result):
+            low_native, high_native, target = result
+            self.loading_settings = True
+            try:
+                self.processing_fields.set_values(dict(reference_label='Пик в заданном ppm-окне',
+                    reference_low=f'{low_native:.12g}', reference_high=f'{high_native:.12g}',
+                    reference_ppm=f'{target:.12g}'))
+            finally:
+                self.loading_settings = False
+            self.settings_changed()
+            self.status.set('Привязка задана. При необходимости уточните «Референс, ppm», затем нажмите «Запомнить → серия».')
+        self.status.set('Определяю референс по выбранному спектру…')
+        self.submit('anchor_reference', work, ready, self.generation)
 
     def update_analysis_controls(self):
         mode = ANALYSIS_LABELS[canonical(self.fit_fields.vars['analysis_label'].get())]
@@ -1130,7 +1171,13 @@ class SpintegrateApp:
                  f'LB={s.processing.lb_hz:g} Гц; threshold={s.fit.threshold:g}. '
                  'Центры и амплитуды определяются заново в каждом спектре.' if s.analysis_method == 'lorentzian' else
                  f'Сохранено областей интегрирования: {len(s.integrals)}. Численный интеграл: интенсивность × ppm.')
-        set_label(self.recipe_label, intro + text)
+        p = s.processing
+        reference = ('Привязка серии: шкала каждого файла, без автоматического выравнивания.'
+                     if p.reference_mode == 'metadata' else
+                     f'Привязка серии: референс {p.reference_ppm:g} ppm; режим {p.reference_mode}.')
+        if p.reference_mode == 'window':
+            reference += f'\nОкно поиска референса: {p.reference_low:g}…{p.reference_high:g} ppm.'
+        set_label(self.recipe_label, intro + text + '\n' + reference)
 
     def export_single(self):
         if self.analysis is None:

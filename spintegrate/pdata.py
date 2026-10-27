@@ -87,9 +87,26 @@ def load_pdata(path, procno='1'):
                     sf, sw, str(directory), phases, notes, 'pdata', metadata)
 
 
+def pdata_uses_positive_transform(source):
+    """Resolve time direction from the original complex spectrum, before edits.
+
+    Reordering the saved descending ppm axis can leave an opposite imaginary
+    convention to our raw FFT. Its inverse then has the decay at *negative*
+    times (the end of the cyclic array). A one-sided EM window on that array
+    erases the peaks. Use the matched positive FFT/IFFT pair in that case.
+    The DC point is excluded so a large constant baseline cannot set direction.
+    No phase angles or imported real/imaginary values are changed here.
+    """
+    fid = ng.proc_base.ifft(source.complex_spectrum)
+    midpoint = len(fid)//2
+    early = np.linalg.norm(fid[1:midpoint])
+    late = np.linalg.norm(fid[-1:-midpoint:-1])
+    return bool(late > early * (1. + 1e-6))
+
+
 def process_pdata(source, p, phase_cache=None):
     from .core import (Spectrum, process_frequency_data, resolve_phase_angles,
-                       spectrum_from_fourier)
+                       reference_axis, spectrum_from_fourier)
     metadata = dict(source.processing_metadata)
     has_imag = bool(metadata.get('has_imaginary', metadata.get('has_imag', False)))
     extra_transform = p.lb_hz > 0 or p.zero_fill_factor != 1 or p.phase != 'none'
@@ -107,30 +124,22 @@ def process_pdata(source, p, phase_cache=None):
         carrier = source.ppm[0] - bins[0]/source.sf_mhz
         phases, notes = resolve_phase_angles(source, p, phase_cache,
                                              reference=source.complex_spectrum)
-        ft = process_frequency_data(source.complex_spectrum, p, source.sw_hz, phases)
+        positive = pdata_uses_positive_transform(source)
+        ft = process_frequency_data(source.complex_spectrum, p, source.sw_hz, phases,
+                                    positive=positive)
         result = spectrum_from_fourier(ft, p, source.sf_mhz, source.sw_hz, carrier,
                                        source.source, phases, list(source.notes) + notes)
         result.source_type = 'pdata'
-        result.processing_metadata = metadata
+        result.processing_metadata = {**metadata, **result.processing_metadata}
         result.processing_metadata['additional_phases'] = list(result.phases)
+        result.processing_metadata['additional_fft_convention'] = 'positive' if positive else 'negative'
         if p.phase == 'none':
             result.phases = source.phases
         result.notes.append('Дополнительная обработка применена к спектру после TopSpin; исходная фазировка не повторяется.')
         return result
-    ppm = source.ppm.copy()
+    ppm, reference_notes, reference_info = reference_axis(source.ppm, source.complex_spectrum, p,
+                                                        intensity=source.intensity)
     y = source.intensity.copy()
-    notes = list(source.notes)
-    if p.reference_mode != 'metadata':
-        mask = np.ones(len(ppm), dtype=bool)
-        if p.reference_mode == 'window':
-            mask = (ppm >= p.reference_low) & (ppm <= p.reference_high)
-            if not mask.any():
-                raise ValueError('Окно референса находится вне спектра.')
-        indexes = np.flatnonzero(mask)
-        index = indexes[np.argmax(np.abs(source.complex_spectrum[indexes]))]
-        ppm += p.reference_ppm - ppm[index]
-        if p.reference_mode == 'strongest':
-            notes.append('Референс = самый сильный пик: проверяйте идентичность сигнала в серии.')
-    ppm += p.ppm_offset
+    notes = list(source.notes) + reference_notes
     return Spectrum(ppm, y, source.complex_spectrum.copy(), source.sf_mhz, source.sw_hz,
-                    source.source, source.phases, notes, 'pdata', metadata)
+                    source.source, source.phases, notes, 'pdata', {**metadata, **reference_info})

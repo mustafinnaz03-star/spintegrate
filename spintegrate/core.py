@@ -368,7 +368,7 @@ def apodize_fid(fid, p, sw_hz):
     return fid
 
 
-def process_frequency_data(base, p, sw_hz, phases):
+def process_frequency_data(base, p, sw_hz, phases, *, positive=False):
     """Phase original frequency data before any additional apodization."""
     if p.phase in ('acme', 'peak_minima'):
         phased = ng.proc_base.ps(base, p0=phases[0], p1=phases[1])
@@ -376,8 +376,10 @@ def process_frequency_data(base, p, sw_hz, phases):
         phased = np.asarray(base).copy()
     if p.lb_hz == 0 and p.zero_fill_factor == 1:
         return phased
-    fid = ng.proc_base.ifft(phased)
-    return ng.proc_base.fft(apodize_fid(fid, p, sw_hz))
+    inverse = ng.proc_base.ifft_positive if positive else ng.proc_base.ifft
+    forward = ng.proc_base.fft_positive if positive else ng.proc_base.fft
+    fid = inverse(phased)
+    return forward(apodize_fid(fid, p, sw_hz))
 
 
 def spectrum_from_fourier(ft, p, sf_mhz, sw_hz, carrier_ppm, source, phases, notes):
@@ -393,24 +395,46 @@ def spectrum_from_fourier(ft, p, sf_mhz, sw_hz, carrier_ppm, source, phases, not
     # instead of endpoint-inclusive linspace; sort/invert only for display.
     frequencies = np.fft.fftshift(np.fft.fftfreq(len(ft), d=1/sw_hz))
     ppm = carrier_ppm + frequencies / sf_mhz
-    if p.reference_mode != 'metadata':
-        mask = np.ones(len(ppm), dtype=bool)
-        if p.reference_mode == 'window':
-            mask = (ppm >= p.reference_low) & (ppm <= p.reference_high)
-            if not mask.any():
-                raise ValueError('Окно референса находится вне спектра.')
-        indexes = np.flatnonzero(mask)
-        # Use magnitude for a stable reference, independently of phase choice.
-        index = indexes[np.argmax(np.abs(ft[indexes]))]
-        ppm = ppm + p.reference_ppm - ppm[index]
-        if p.reference_mode == 'strongest':
-            notes.append('Референс = самый сильный пик: проверяйте идентичность сигнала в серии.')
-    ppm = ppm + p.ppm_offset
+    ppm, reference_notes, reference_info = reference_axis(ppm, ft, p, intensity=y)
+    notes.extend(reference_notes)
     order = np.argsort(ppm)
     if not np.isfinite(y).all():
         raise ValueError('После обработки появились нечисловые значения.')
     return Spectrum(ppm[order], np.asarray(y)[order], ft[order], sf_mhz,
-                    sw_hz, source, phases, notes)
+                    sw_hz, source, phases, notes, processing_metadata=reference_info)
+
+
+def window_reference_index(ppm, intensity, low, high):
+    """Locate the selected absorption/magnitude signal above a local linear background."""
+    indexes = np.flatnonzero((ppm >= low) & (ppm <= high))
+    if not len(indexes):
+        raise ValueError('Окно референса находится вне спектра.')
+    if len(indexes) < 3:
+        raise ValueError('Окно референса должно содержать не менее трёх точек.')
+    x, y = ppm[indexes], np.asarray(intensity)[indexes]
+    background = y[0] + (y[-1]-y[0])*(x-x[0])/(x[-1]-x[0])
+    return int(indexes[np.argmax(np.abs(y-background))])
+
+
+def reference_axis(ppm, values, p, intensity=None):
+    """Apply the same saved reference rule independently to each spectrum."""
+    ppm = np.asarray(ppm)
+    notes, shift, observed = [], 0., None
+    if p.reference_mode != 'metadata':
+        if p.reference_mode == 'window':
+            index = window_reference_index(ppm, np.abs(values) if intensity is None else intensity,
+                                           p.reference_low, p.reference_high)
+        else:
+            # Preserve the legacy strongest-magnitude rule outside a chosen window.
+            index = int(np.argmax(np.abs(values)))
+        observed = float(ppm[index])
+        shift = p.reference_ppm - observed
+        if p.reference_mode == 'strongest':
+            notes.append('Референс = самый сильный пик: проверяйте идентичность сигнала в серии.')
+    info = dict(reference_mode=p.reference_mode, reference_observed_ppm=observed,
+                reference_target_ppm=p.reference_ppm if observed is not None else None,
+                reference_shift_ppm=float(shift+p.ppm_offset))
+    return ppm + shift + p.ppm_offset, notes, info
 
 
 def baseline_correct(x, y, b: BaselineSettings):
@@ -900,7 +924,7 @@ def batch_analyze(root, session: Session, csv_path, progress: Callable | None = 
                    spectrum_id=ident, source_path=str(path.resolve()), fit_file='',
                    analysis_method=session.analysis_method, source_mode=session.processing.source_mode,
                    status='error', warnings='', phase_p0_deg='', phase_p1_deg='',
-                   peak_count='', max_relative_rmse='')
+                   peak_count='', max_relative_rmse='', reference_shift_ppm='')
         row.update({f'integral__{r.name}': float('nan') for r in session.integrals})
         details = dict(spectrum_id=ident, errors={}, diagnostics={})
         try:
@@ -909,6 +933,7 @@ def batch_analyze(root, session: Session, csv_path, progress: Callable | None = 
             row.update({f'integral__{n}': v for n, v in analysis.integrals.items()})
             row.update(status=analysis.status, warnings=' | '.join(analysis.notes),
                        phase_p0_deg=analysis.spectrum.phases[0], phase_p1_deg=analysis.spectrum.phases[1],
+                       reference_shift_ppm=analysis.spectrum.processing_metadata.get('reference_shift_ppm', 0.),
                        peak_count=sum(len(r.centers) for r in analysis.results.values()))
             rmses = [r.diagnostics.get('relative_rmse') for r in analysis.results.values()]
             row['max_relative_rmse'] = max((v for v in rmses if v is not None), default='')
