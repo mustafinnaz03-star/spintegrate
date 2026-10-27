@@ -29,7 +29,8 @@ def test_pdata_direct_json_recalculates_each_region_in_each_spectrum(tmp_path, m
     saved = json.loads((tmp_path/'recipe.json').read_text(encoding='utf-8'))
     for region in saved['regions']:
         assert region['baseline'] == vars(baseline)
-        assert not any(isinstance(v, (list, dict)) for v in region['baseline'].values())
+        assert region['baseline']['parameters'] == {}
+        assert not any(isinstance(v, (list, dict)) for k, v in region['baseline'].items() if k != 'parameters')
     loaded = Session.load(tmp_path/'recipe.json')
     original = copy.deepcopy(loaded)
     actual_baseline = core.baseline_correct

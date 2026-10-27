@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import json
 import queue
 import threading
 import tkinter as tk
@@ -27,6 +28,8 @@ from .appearance import AREA_COLORS, AppearanceSettings, area_color, validate_ap
 from .figure_export import render_fit_figure, save_figure
 from .i18n import TranslatedVar, canonical, set_label, tr, translate_widgets, widget_language
 from .region_names import next_region_name
+from .baseline_ui import BaselineControls
+from .region_editing import RegionHistory, move_or_resize
 
 
 PHASE_LABELS = {'Без коррекции': 'none', 'ACME (nmrglue)': 'acme',
@@ -155,8 +158,9 @@ class SpintegrateApp:
         self.language = 'ru'
         root._spintegrate_language = self.language
         root.title('Spintegrate — анализ из pdata' if source_mode == 'pdata' else 'Spintegrate — анализ спектров ЯМР (raw)')
-        root.geometry('1400x920')
-        root.minsize(1080, 750)
+        available_width, available_height = max(700, root.winfo_screenwidth()-80), max(500, root.winfo_screenheight()-100)
+        root.geometry(f'{min(1400, available_width)}x{min(920, available_height)}')
+        root.minsize(min(1080, available_width), min(750, available_height))
         style = ttk.Style(root)
         style.theme_use('clam')
         style.configure('.', font=('Segoe UI', 10))
@@ -193,6 +197,8 @@ class SpintegrateApp:
         self._naming_sync = False
         self._region_events_suspended = 0
         self._region_event_timers = set()
+        self.region_history = RegionHistory()
+        self.region_dragging = False
         self.preprocess_window = None
         self.status = TranslatedVar(root, value='Откройте папку эксперимента Bruker или демонстрационный спектр.')
         self._build()
@@ -336,13 +342,15 @@ class SpintegrateApp:
         self.residual_ax = self.figure.add_subplot(grid[2], sharex=self.detail_ax)
         self.figure.subplots_adjust(left=.09, right=.98, top=.95, bottom=.08)
         self.canvas = FigureCanvasTkAgg(self.figure, master=right)
-        self.canvas.get_tk_widget().pack(fill='both', expand=True)
         self.toolbar = NavigationToolbar2Tk(self.canvas, right)
         self.toolbar.update()
+        self.canvas.mpl_connect('key_press_event', self.region_edit_key)
         self.selectors = []
         self.selection_label = ttk.Label(right, text='Во вкладке «Области» выберите режим, '
                                         'затем выделите диапазон мышью на графике.')
-        self.selection_label.pack(fill='x', padx=8, pady=4)
+        self.selection_label.pack(side='bottom', fill='x', padx=8, pady=4)
+        self.selection_label.bind('<Configure>', lambda event: self.selection_label.configure(wraplength=max(150, event.width-20)))
+        self.canvas.get_tk_widget().pack(fill='both', expand=True)
         self._draw_empty()
         self._build_batch()
         ttk.Label(self.root, textvariable=self.status, padding=(12, 8),
@@ -357,7 +365,7 @@ class SpintegrateApp:
         ttk.Radiobutton(modes, text='Обработка', variable=self.selection_mode, value='fit').pack(side='left')
         ttk.Radiobutton(modes, text='Интеграл', variable=self.selection_mode, value='integral').pack(side='left')
         self.region_name = tk.StringVar(value='region_1')
-        self.selection_mode.trace_add('write', lambda *_: self.prepare_region_name())
+        self.selection_mode.trace_add('write', lambda *_: self.selection_mode_changed())
         self.bound_low, self.bound_high = tk.StringVar(value='3.0'), tk.StringVar(value='4.0')
         form = ttk.Frame(parent, padding=8)
         form.pack(fill='x')
@@ -382,6 +390,13 @@ class SpintegrateApp:
         buttons.pack(fill='x', padx=8)
         ttk.Button(buttons, text='Сохранить область', command=self.add_region).pack(side='left', padx=2)
         ttk.Button(buttons, text='Изменить выбранную', command=self.update_region).pack(side='left', padx=2)
+        editing = ttk.Frame(parent)
+        editing.pack(fill='x', padx=8, pady=6)
+        self.edit_regions = tk.BooleanVar(value=False)
+        ttk.Checkbutton(editing, text='Двигать границы на графике', variable=self.edit_regions,
+                        command=self.toggle_region_editing).pack(side='left')
+        self.region_undo_button = ttk.Button(editing, text='Отменить границы', command=self.undo_region_bounds, state='disabled')
+        self.region_undo_button.pack(side='left', padx=5)
         self.region_tree = ttk.Treeview(parent, columns=('bounds', 'baseline'), show='tree headings', height=7)
         self.region_tree.heading('#0', text='Обработка')
         self.region_tree.heading('bounds', text='ppm')
@@ -468,6 +483,8 @@ class SpintegrateApp:
                  'Рядом сохраняются JSON и папка .fits с файлами .spfit.')
 
     def _sync_widgets(self):
+        self.region_history.clear()
+        self.region_dragging = False
         self.loading_settings = True
         p = asdict(self.session.processing)
         p['phase_label'] = next(k for k, v in PHASE_LABELS.items() if v == p['phase'])
@@ -849,6 +866,8 @@ class SpintegrateApp:
         self.canvas.draw_idle()
 
     def draw(self, local=None):
+        if self.region_dragging:
+            return
         # Clear selectors before axes; retain references for interactive dragging.
         for selector in self.selectors:
             selector.disconnect_events()
@@ -856,11 +875,125 @@ class SpintegrateApp:
         draw_spectrum(self.overview_ax, self.detail_ax, self.residual_ax, self.spectrum,
                       self.session, self.selected_region, self.analysis, local, language=self.language)
         if self.spectrum is not None:
+            kind = self.selection_mode.get()
+            if kind == 'integral':
+                selected = self.area_tree.selection()
+                editable = next((a for a in self.session.integrals if selected and a.name == selected[0]), None)
+            else:
+                editable = next((r for r in self.session.regions if r.name == self.selected_region), None)
+            if self.edit_regions.get():
+                set_label(self.selection_label, 'Выберите сохранённую область в таблице. Потяните край для изменения размера '
+                          'или середину для перемещения. Ctrl+Z отменяет изменение; Esc отменяет перетаскивание.')
+                if editable is None:
+                    self.canvas.draw_idle()
+                    return
             for ax in (self.overview_ax, self.detail_ax):
-                self.selectors.append(SpanSelector(ax, self.on_span, 'horizontal', useblit=True,
-                                      props=dict(alpha=.25, facecolor='#e6a24a'), button=1,
-                                      interactive=False, minspan=0))
+                editing = self.edit_regions.get() and editable is not None
+                callback = (lambda low, high, k=kind, n=editable.name: self.edit_saved_bounds(k, n, low, high)) if editing else self.on_span
+                span_pixels = abs(ax.transData.transform((editable.high, 0))[0]-ax.transData.transform((editable.low, 0))[0]) if editing else 40.
+                selector = SpanSelector(ax, callback, 'horizontal', useblit=True,
+                    props=dict(alpha=.25, facecolor='#e6a24a'), button=1,
+                    interactive=editing, drag_from_anywhere=editing, ignore_event_outside=editing,
+                    grab_range=max(1., min(8., span_pixels/4)),
+                    onmove_callback=self.preview_region_bounds if editing else None, minspan=1e-10)
+                if editing:
+                    selector.extents = (editable.low, editable.high)
+                    if ax == self.detail_ax and kind == 'fit':
+                        margin = .12*(editable.high-editable.low)
+                        ax.set_xlim(editable.high+margin, editable.low-margin)
+                self.selectors.append(selector)
         self.canvas.draw_idle()
+
+    def preview_region_bounds(self, low, high):
+        self.region_dragging = True
+        self.bound_low.set(f'{min(low, high):.6f}')
+        self.bound_high.set(f'{max(low, high):.6f}')
+
+    def selection_mode_changed(self):
+        self.prepare_region_name()
+        if (hasattr(self, 'edit_regions') and self.edit_regions.get()
+                and not self.loading_settings and not self._naming_sync):
+            self.toggle_region_editing()
+
+    def toggle_region_editing(self):
+        self.region_dragging = False
+        self.restore_region_bound_fields()
+        if not self.edit_regions.get():
+            set_label(self.selection_label, 'Выделение мышью заполняет границы новой области.')
+        self.draw(local=self.preview_local)
+
+    def restore_region_bound_fields(self):
+        if self.selection_mode.get() == 'integral':
+            selected = self.area_tree.selection()
+            area = next((a for a in self.session.integrals if selected and a.name == selected[0]), None)
+        else:
+            area = next((r for r in self.session.regions if r.name == self.selected_region), None)
+        if area:
+            self.region_name.set(area.name)
+            self.bound_low.set(f'{area.low:.6f}')
+            self.bound_high.set(f'{area.high:.6f}')
+
+    def edit_saved_bounds(self, kind, name, low, high):
+        self.region_dragging = False
+        if self.toolbar.mode or self.spectrum is None:
+            return
+        try:
+            recipe = self.read_settings()
+            edited = move_or_resize(recipe, kind, name, low, high,
+                                    (self.spectrum.ppm[0], self.spectrum.ppm[-1]))
+            if edited.regions == recipe.regions and edited.integrals == recipe.integrals:
+                self.draw(local=self.preview_local)
+                return
+            self.region_history.record(recipe)
+            self.session = edited
+            if self.preprocess_window:
+                self.preprocess_window.load_settings()
+            self.refresh_regions()
+            if kind == 'integral':
+                self.area_tree.selection_set(name)
+                area = next(a for a in edited.integrals if a.name == name)
+            else:
+                area = next(r for r in edited.regions if r.name == name)
+            self.region_name.set(name)
+            self.bound_low.set(f'{area.low:.6f}')
+            self.bound_high.set(f'{area.high:.6f}')
+            self.invalidate()
+            self.draw()
+            self.schedule_preview()
+        except ValueError as exc:
+            self.status.set(str(exc))
+            self.draw(local=self.preview_local)
+
+    def undo_region_bounds(self):
+        self.region_dragging = False
+        if not self.region_history.states:
+            return
+        try:
+            self.session = self.region_history.undo(self.read_settings())
+            selected = self.area_tree.selection() if self.selection_mode.get() == 'integral' else ()
+            if self.preprocess_window:
+                self.preprocess_window.load_settings()
+            self.refresh_regions()
+            if selected:
+                self.area_tree.selection_set(selected[0])
+            area = next((a for a in self.session.integrals if selected and a.name == selected[0]), None)
+            area = area or next((r for r in self.session.regions if r.name == self.selected_region), None)
+            if area:
+                self.bound_low.set(f'{area.low:.6f}')
+                self.bound_high.set(f'{area.high:.6f}')
+            self.invalidate()
+            self.draw()
+            self.schedule_preview()
+        except ValueError as exc:
+            self.status.set(str(exc))
+
+    def region_edit_key(self, event):
+        if event.key == 'escape' and self.region_dragging:
+            self.region_dragging = False
+            self.restore_region_bound_fields()
+            self.draw(local=self.preview_local)
+        elif event.key in ('ctrl+z', 'cmd+z') and self.edit_regions.get():
+            self.undo_region_bounds()
 
     def on_span(self, low, high):
         if self.toolbar.mode or abs(high-low) < 1e-9:
@@ -894,6 +1027,7 @@ class SpintegrateApp:
             self.region_name.set(name)
 
     def refresh_regions(self):
+        self.region_undo_button.configure(state='normal' if self.region_history.states else 'disabled')
         self._suspend_region_events()
         self.loading_settings = True
         for tree in (self.region_tree, self.area_tree):
@@ -947,6 +1081,7 @@ class SpintegrateApp:
             target.append(region)
             s.validate()
             self.session = s
+            self.region_history.clear()
             if isinstance(region, FitRegion):
                 self.selected_region = region.name
             else:
@@ -983,6 +1118,7 @@ class SpintegrateApp:
                 s.integrals = [new if r.name == old else r for r in s.integrals]
             s.validate()
             self.session = s
+            self.region_history.clear()
             self.refresh_regions()
             self.invalidate()
             self.preview()
@@ -1044,6 +1180,7 @@ class SpintegrateApp:
             return
         self.session.regions = [r for r in self.session.regions if r.name != name]
         self.session.integrals = [r for r in self.session.integrals if r.parent != name]
+        self.region_history.clear()
         self.refresh_regions()
         self.invalidate()
         self.preview()
@@ -1052,6 +1189,7 @@ class SpintegrateApp:
         selection = self.area_tree.selection()
         if selection:
             self.session.integrals = [r for r in self.session.integrals if r.name != selection[0]]
+            self.region_history.clear()
             self.refresh_regions()
             self.invalidate()
             self.preview()
@@ -1635,8 +1773,9 @@ class PreprocessWindow:
         self.app = app
         self.window = tk.Toplevel(app.root)
         self.window.title('Аподизация и локальная базовая линия')
-        self.window.geometry('1180x790')
-        self.window.minsize(1000, 700)
+        available_width, available_height = max(700, app.root.winfo_screenwidth()-80), max(500, app.root.winfo_screenheight()-100)
+        self.window.geometry(f'{min(1280, available_width)}x{min(820, available_height)}')
+        self.window.minsize(min(1000, available_width), min(650, available_height))
         self.timer = None
         self.revision = 0
         self.loading = True
@@ -1647,10 +1786,16 @@ class PreprocessWindow:
         self.cached_region = None
         self.cached_baseline = None
         self.cached_lb = 0.
+        self.status = TranslatedVar(self.window, value='Выберите сохранённую область в главном окне.')
+        self.status_label = ttk.Label(self.window, textvariable=self.status, padding=8, wraplength=1100)
+        self.status_label.pack(side='bottom', fill='x')
+        self.status_label.bind('<Configure>', lambda event: self.status_label.configure(wraplength=max(150, event.width-20)))
         split = ttk.Panedwindow(self.window, orient='horizontal')
         split.pack(fill='both', expand=True)
-        left, right = ttk.Frame(split, padding=10), ttk.Frame(split)
-        split.add(left, weight=0)
+        controls, right = ScrollPanel(split), ttk.Frame(split)
+        controls.canvas.configure(width=420)
+        left = controls.body
+        split.add(controls, weight=0)
         split.add(right, weight=1)
         ttk.Label(left, text='Аподизация (экспоненциальная)', font=('Segoe UI', 12, 'bold')).pack(anchor='w')
         self.lb_var = tk.StringVar(value=str(app.session.processing.lb_hz))
@@ -1667,22 +1812,15 @@ class PreprocessWindow:
         ttk.Label(left, text='Базовая линия выбранной области', font=('Segoe UI', 12, 'bold')).pack(anchor='w')
         self.region_label = ttk.Label(left, text='', wraplength=345)
         self.region_label.pack(anchor='w', pady=8)
-        self.fields = FieldPanel(left, self.changed)
-        self.fields.pack(fill='x')
         self.editing_region = app.selected_region
+        self.baseline_history = {}
+        self.restoring_baseline = False
         selected = next((r for r in app.session.regions if r.name == self.editing_region), None)
         b = selected.baseline if selected else app.session.baseline_default
-        add = self.fields.add
-        add('method', 'Метод', b.method, BASELINE_METHODS, str)
-        add('lam', 'λ (Whittaker)', b.lam)
-        add('p', 'p (asls / iasls)', b.p)
-        add('max_iter', 'Максимум итераций', b.max_iter, kind=int)
-        add('tol', 'Допуск tol', b.tol)
-        add('half_window', 'Полуокно SNIP / mor', b.half_window, kind=int)
-        add('smooth_half_window', 'Сглаживание SNIP, точки', b.smooth_half_window, kind=int)
-        add('poly_order', 'Степень modpoly / imodpoly', b.poly_order, kind=int)
-        ttk.Button(left, text='Взять базу из выбранной области', command=self.load_region_baseline).pack(fill='x', pady=3)
-        ttk.Button(left, text='Применить к выбранной области', command=lambda: self.apply_baseline(False)).pack(fill='x', pady=3)
+        self.fields = BaselineControls(left, b, self.changed)
+        self.fields.pack(fill='x', padx=8)
+        self.undo_baseline_button = ttk.Button(left, text='Отменить изменение базы', command=self.undo_baseline, state='disabled')
+        self.undo_baseline_button.pack(fill='x', pady=3)
         ttk.Button(left, text='Применить ко всем областям', command=lambda: self.apply_baseline(True)).pack(fill='x', pady=3)
         ttk.Label(left, text='Изменения сразу сохраняются для выбранной области и новых областей. '
                   'В JSON сохраняются только метод и параметры; базовая линия рассчитывается заново для каждого спектра. '
@@ -1691,11 +1829,20 @@ class PreprocessWindow:
         self.figure = Figure(figsize=(8, 7), dpi=100, facecolor='white')
         self.ax_apod, self.ax_base = self.figure.subplots(2, 1)
         self.figure.subplots_adjust(left=.10, right=.98, top=.94, bottom=.08, hspace=.4)
+        preview_controls = ttk.Frame(right, padding=4)
+        preview_controls.pack(fill='x')
+        self.curve_visibility = {}
+        for key, label in (('raw', 'Исходная область'), ('baseline', 'Базовая линия'), ('corrected', 'После коррекции')):
+            self.curve_visibility[key] = tk.BooleanVar(value=True)
+            ttk.Checkbutton(preview_controls, text=label, variable=self.curve_visibility[key],
+                            command=self.redraw_preview).pack(side='left', padx=4)
+        self.pick_anchors = tk.BooleanVar(value=False)
+        ttk.Checkbutton(right, text='Выбирать опорные точки: левая кнопка добавляет, правая удаляет',
+                        variable=self.pick_anchors, command=self.enable_anchors).pack(anchor='w', padx=5)
         self.canvas = FigureCanvasTkAgg(self.figure, master=right)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, right)
         self.canvas.get_tk_widget().pack(fill='both', expand=True)
-        NavigationToolbar2Tk(self.canvas, right)
-        self.status = TranslatedVar(self.window, value='Выберите сохранённую область в главном окне.')
-        ttk.Label(self.window, textvariable=self.status, wraplength=1100, padding=8).pack(fill='x')
+        self.canvas.mpl_connect('button_press_event', self.on_anchor_click)
         self.lb_var.trace_add('write', lambda *_: self.changed())
         self.loading = False
         self.window.protocol('WM_DELETE_WINDOW', self.close)
@@ -1725,12 +1872,15 @@ class PreprocessWindow:
         self.fields.set_values(asdict(r.baseline if r else self.app.session.baseline_default))
         self.editing_region = self.app.selected_region
         self.loading = False
+        self.update_undo_button()
 
     def load_region_baseline(self):
         self.sync_region_controls(force=True)
         self.changed()
 
     def load_settings(self):
+        self.baseline_history.clear()
+        self.update_undo_button()
         self.sync_region_controls(force=True)
         self.loading = True
         self.lb_var.set(str(self.app.session.processing.lb_hz))
@@ -1754,7 +1904,12 @@ class PreprocessWindow:
         if baseline_changed:
             self.app.session.baseline_default = copy.deepcopy(b)
         if r is not None and baseline_changed:
+            if not self.restoring_baseline:
+                history = self.baseline_history.setdefault(r.name, [])
+                history.append(copy.deepcopy(r.baseline))
+                del history[:-30]
             r.baseline = copy.deepcopy(b)
+        self.update_undo_button()
         if changed:
             self.app.refresh_regions()
             self.app.invalidate()
@@ -1839,6 +1994,12 @@ class PreprocessWindow:
             self.ax_base.plot(x, y, color='#a8b4c1', lw=.9, label=t('Исходная область'))
             self.ax_base.plot(x, line, color='#d26335', lw=1., label=t(f'База: {b.method}'))
             self.ax_base.plot(x, corrected, color='#254b79', lw=1., label=t('После коррекции'))
+            for key, line_artist in zip(('raw', 'baseline', 'corrected'), self.ax_base.lines):
+                line_artist.set_visible(self.curve_visibility[key].get())
+            if b.method == 'interp_pts':
+                anchors = b.parameters.get('anchor_ppm', [])
+                if anchors:
+                    self.ax_base.scatter(anchors, np.interp(anchors, x, y), color='#d26335', marker='o', zorder=5)
             self.ax_base.set_xlim(r.high, r.low)
             self.status.set(' | '.join(notes) if notes else 'Предпросмотр готов; база применяется только внутри выбранной области.')
         else:
@@ -1853,6 +2014,49 @@ class PreprocessWindow:
                 ax.legend(fontsize=8)
         self.canvas.draw_idle()
 
+    def redraw_preview(self):
+        if self.cached_result is not None:
+            self.draw_cached()
+
+    def enable_anchors(self):
+        if self.pick_anchors.get():
+            self.fields.vars['method'].set('interp_pts')
+
+    def on_anchor_click(self, event):
+        if self.toolbar.mode or not self.pick_anchors.get() or event.inaxes != self.ax_base or event.xdata is None:
+            return
+        if self.fields.method != 'interp_pts' or not self.cached_region or event.button not in (1, 3):
+            return
+        region = self.cached_region
+        if not region.low <= event.xdata <= region.high:
+            return
+        try:
+            b = BaselineSettings(**self.fields.values())
+            anchors = list(b.parameters.get('anchor_ppm', []))
+            if event.button == 1:
+                anchors.append(float(event.xdata))
+            elif anchors:
+                anchors.remove(min(anchors, key=lambda x: abs(x-event.xdata)))
+            self.fields.vars['anchor_ppm'].set(json.dumps(sorted(set(anchors))))
+        except ValueError as exc:
+            self.status.set(str(exc))
+
+    def undo_baseline(self):
+        history = self.baseline_history.get(self.app.selected_region, [])
+        if not history:
+            return
+        self.restoring_baseline = True
+        try:
+            self.fields.set_values(asdict(history.pop()))
+            self.changed()
+        finally:
+            self.restoring_baseline = False
+            self.update_undo_button()
+
+    def update_undo_button(self):
+        if hasattr(self, 'undo_baseline_button'):
+            self.undo_baseline_button.configure(state='normal' if self.baseline_history.get(self.app.selected_region) else 'disabled')
+
     def apply_baseline(self, all_regions=False):
         try:
             b = BaselineSettings(**self.fields.values())
@@ -1862,6 +2066,10 @@ class PreprocessWindow:
             if not targets:
                 raise ValueError('Выберите сохранённую область обработки.')
             for r in targets:
+                if r.baseline != b:
+                    history = self.baseline_history.setdefault(r.name, [])
+                    history.append(copy.deepcopy(r.baseline))
+                    del history[:-30]
                 r.baseline = copy.deepcopy(b)
             s.validate()
             self.app.session = s

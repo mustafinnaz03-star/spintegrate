@@ -18,10 +18,9 @@ import numpy as np
 from pybaselines import Baseline
 from scipy.optimize import least_squares
 from .appearance import AppearanceSettings, validate_appearance, validate_color
+from .baseline_methods import BASELINE_METHODS, effective_parameters, fit_baseline, parameter_specs, validate_parameters
 
 
-BASELINE_METHODS = ('none', 'asls', 'arpls', 'airpls', 'drpls', 'iasls',
-                    'snip', 'modpoly', 'imodpoly', 'mor')
 PHASE_MODES = ('none', 'acme', 'peak_minima', 'abs')
 
 
@@ -35,6 +34,7 @@ class BaselineSettings:
     half_window: int = 30
     smooth_half_window: int = 3
     poly_order: int = 3
+    parameters: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -192,10 +192,14 @@ class Session:
 def validate_baseline(b: BaselineSettings):
     if b.method not in BASELINE_METHODS:
         raise ValueError(f'Неизвестный метод базовой линии: {b.method}')
+    if any(isinstance(getattr(b, key), bool) or not isinstance(getattr(b, key), int)
+           for key in ('max_iter', 'half_window', 'smooth_half_window', 'poly_order')):
+        raise ValueError('Window sizes, polynomial order and iteration limits must be integers.')
     if (not np.isfinite([b.lam, b.p, b.tol]).all() or b.lam <= 0 or not 0 < b.p < 1
             or b.tol <= 0 or b.max_iter < 1 or b.half_window < 1
             or b.smooth_half_window < 0 or b.poly_order < 0):
         raise ValueError('Некорректные параметры базовой линии.')
+    validate_parameters(b)
 
 
 @dataclass
@@ -445,28 +449,19 @@ def baseline_correct(x, y, b: BaselineSettings):
     if b.method == 'none':
         return y.copy(), np.zeros_like(y), []
     fitter = Baseline(x_data=x, check_finite=True)
-    whittaker = dict(lam=b.lam, max_iter=b.max_iter, tol=b.tol)
-    if b.method in ('asls', 'iasls'):
-        kwargs = {**whittaker, 'p': b.p}
-    elif b.method in ('arpls', 'airpls', 'drpls'):
-        kwargs = whittaker
-    elif b.method == 'snip':
-        kwargs = dict(max_half_window=min(b.half_window, (len(x)-1)//2),
-                      decreasing=True, smooth_half_window=min(b.smooth_half_window, (len(x)-1)//2))
-    elif b.method in ('modpoly', 'imodpoly'):
-        kwargs = dict(poly_order=min(b.poly_order, len(x)-2), max_iter=b.max_iter, tol=b.tol)
-    else:
-        kwargs = dict(half_window=min(b.half_window, (len(x)-1)//2))
     # Baseline algorithms operate on normalized intensities for numeric stability.
     scale = max(float(np.max(np.abs(y))), np.finfo(float).tiny)
     with warnings.catch_warnings(record=True) as caught:
-        line, params = getattr(fitter, b.method)(y / scale, **kwargs)
+        line, params = fit_baseline(fitter, x, y / scale, b)
     line = np.asarray(line) * scale
-    if not np.isfinite(line).all():
+    if line.shape != y.shape or not np.isfinite(line).all():
         raise ValueError('Коррекция базовой линии вернула нечисловые значения.')
     notes = [str(w.message) for w in caught]
     history = params.get('tol_history')
-    if history is not None and len(history) and np.asarray(history).ravel()[-1] > b.tol:
+    tolerance = effective_parameters(b).get('tol', parameter_specs(b.method).get('tol'))
+    if tolerance is None:
+        tolerance = parameter_specs(b.method).get('tol')
+    if history is not None and len(history) and tolerance is not None and np.asarray(history).ravel()[-1] > tolerance:
         notes.append(f'{b.method}: базовая линия не достигла tol={b.tol:g}.')
     return y - line, line, notes
 

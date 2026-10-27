@@ -6,6 +6,24 @@ from tkinter import ttk
 
 
 EN = {
+    'Двигать границы на графике': 'Edit saved regions on plot',
+    'Отменить границы': 'Undo region bounds',
+    'Выделение мышью заполняет границы новой области.': 'Drag to select bounds for a new region.',
+    'Выберите сохранённую область в таблице. Потяните край для изменения размера или середину для перемещения. Ctrl+Z отменяет изменение; Esc отменяет перетаскивание.':
+        'Select a saved region in the table. Drag an edge to resize or the middle to move. Ctrl+Z undoes an edit; Esc cancels a drag.',
+    'Семейство алгоритмов': 'Algorithm family', 'Поиск метода': 'Find method',
+    'Все методы': 'All methods', 'Уиттекер / штрафные наименьшие квадраты': 'Whittaker / penalized least squares',
+    'Морфологические': 'Morphological', 'Полиномиальные': 'Polynomial', 'Сплайны': 'Splines',
+    'Сглаживание / отсечение пиков': 'Smoothing / peak clipping',
+    'Классификация базы и пиков': 'Baseline / peak classification',
+    'Оптимизаторы': 'Optimizers', 'Другие методы': 'Other methods',
+    'Параметры по умолчанию': 'Reset parameters', 'Справка по методу': 'Method reference',
+    'Расширенные параметры': 'Advanced parameters',
+    'Опорные позиции, ppm': 'Anchor positions, ppm', 'Отменить изменение базы': 'Undo baseline change',
+    'Выбирать опорные точки: левая кнопка добавляет, правая удаляет':
+        'Pick baseline anchors: left click adds, right click removes',
+    'auto — выбор библиотеки. Списки и объекты вводятся в JSON. Пороговые интенсивности задаются для сигнала, нормированного к max|I| = 1.':
+        'auto uses the library default. Enter lists and objects as JSON. Intensity thresholds use a signal normalized to max|I| = 1.',
     'Spintegrate — анализ спектров ЯМР (raw)': 'Spintegrate — raw NMR analysis',
     'Spintegrate — анализ из pdata': 'Spintegrate — processed pdata analysis',
     'Анализировать pdata…': 'Analyze pdata…', 'Анализировать raw…': 'Analyze raw…',
