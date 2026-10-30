@@ -1,7 +1,8 @@
 """Numerical pipeline, independent of the desktop interface.
 
 Lorentzian width is HWHM in ppm. The historical Spintegrate integral is A*w;
-the whole-line mathematical area is pi*A*w. Centers are NEVER fit parameters.
+the whole-line mathematical area is pi*A*w. Automatic peak-picking fixes centers;
+the separate manual-peak mode also refines centers within bounded windows.
 """
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ import csv
 import json
 import warnings
 import threading
+import copy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -78,6 +80,7 @@ class FitSettings:
     loss: str = 'linear'
     residual_warning: float = .15
     cancellation_warning: float = .7
+    center_tolerance_ppm: float = .03  # residual drift after alignment, manual mode only
 
 
 @dataclass
@@ -86,6 +89,7 @@ class FitRegion:
     low: float
     high: float
     baseline: BaselineSettings = field(default_factory=BaselineSettings)
+    manual_peaks: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -113,8 +117,8 @@ class Session:
         validate_appearance(self.appearance)
         self.alignment.validate()
         p, f = self.processing, self.fit
-        if self.analysis_method not in ('lorentzian', 'direct'):
-            raise ValueError('Неизвестный метод анализа: lorentzian или direct.')
+        if self.analysis_method not in ('lorentzian', 'lorentzian_manual', 'direct'):
+            raise ValueError('Неизвестный метод анализа: lorentzian, lorentzian_manual или direct.')
         if p.source_mode not in ('raw', 'pdata'):
             raise ValueError('Источник спектра должен быть raw или pdata.')
         if p.source_mode == 'pdata' and (not str(p.pdata_procno).isdigit() or int(p.pdata_procno) < 1):
@@ -131,8 +135,8 @@ class Session:
             raise ValueError('Окно peak_minima должно быть положительным.')
         if p.reference_mode == 'window' and p.reference_low >= p.reference_high:
             raise ValueError('Неверное окно референса.')
-        if self.analysis_method == 'lorentzian':
-            if not (np.isfinite(f.threshold) and f.threshold > 0):
+        if self.analysis_method != 'direct':
+            if self.analysis_method == 'lorentzian' and not (np.isfinite(f.threshold) and f.threshold > 0):
                 raise ValueError('Threshold должен быть положительным.')
             if not (0 < f.min_width_hz < f.max_width_hz) or f.initial_width_hz <= 0:
                 raise ValueError('Ширины: 0 < min < max; initial > 0.')
@@ -142,6 +146,8 @@ class Session:
                 raise ValueError('Loss: linear или soft_l1.')
             if not 0 < f.cancellation_warning < 1 or f.residual_warning <= 0:
                 raise ValueError('Неверные пороги диагностики.')
+            if self.analysis_method == 'lorentzian_manual' and (not np.isfinite(f.center_tolerance_ppm) or f.center_tolerance_ppm <= 0):
+                raise ValueError('Допуск смещения ручных пиков должен быть положительным, в ppm.')
         if require_regions and (not self.regions or not self.integrals):
             raise ValueError('Сохраните области обработки и интегрирования.')
         names = [r.name for r in self.regions]
@@ -152,6 +158,15 @@ class Session:
             if not np.isfinite([r.low, r.high]).all() or r.low >= r.high:
                 raise ValueError(f'{r.name}: нужны две различные конечные границы.')
             validate_baseline(r.baseline)
+            peaks = np.asarray(r.manual_peaks, dtype=float)
+            if (peaks.ndim != 1 or not np.isfinite(peaks).all() or len(set(peaks)) != len(peaks)
+                    or np.any(peaks <= r.low) or np.any(peaks >= r.high)):
+                raise ValueError(f'{r.name}: ручные пики должны быть уникальными и строго внутри области.')
+            if require_regions and self.analysis_method == 'lorentzian_manual':
+                if not len(peaks):
+                    raise ValueError(f'{r.name}: сначала отметьте ручные пики.')
+                if len(peaks) > f.max_peaks:
+                    raise ValueError(f'{r.name}: число ручных пиков превышает лимит {f.max_peaks}.')
         intnames = [r.name for r in self.integrals]
         if len(intnames) != len(set(intnames)) or any(not n.strip() for n in intnames):
             raise ValueError('Имена интегралов должны быть уникальны.')
@@ -169,7 +184,7 @@ class Session:
                    p.manual_phase_p0, p.manual_phase_p1, p.phase_pivot_fraction]
         if not 0 <= p.phase_pivot_fraction <= 1:
             raise ValueError('Phase pivot must lie inside the spectrum.')
-        if self.analysis_method == 'lorentzian':
+        if self.analysis_method != 'direct':
             numeric += [f.initial_width_hz, f.min_width_hz, f.max_width_hz]
         if not np.isfinite(numeric).all():
             raise ValueError('Настройки должны содержать конечные числа.')
@@ -513,6 +528,12 @@ def lorentzian(x, center, width, amplitude):
     return amplitude * width**2 / ((np.asarray(x) - center)**2 + width**2)
 
 
+def manual_peak_guesses(x, corrected, region):
+    """Use the saved ppm marks; sample fresh baseline-corrected heights per trace."""
+    centers = np.sort(np.asarray(region.manual_peaks, dtype=float))
+    return centers, np.interp(centers, x, corrected) if len(centers) else np.array([], dtype=float)
+
+
 @dataclass
 class FitResult:
     region: str
@@ -560,20 +581,28 @@ def fit_region(spectrum: Spectrum, region: FitRegion, settings: Session) -> FitR
     x, y = xall[mask], spectrum.intensity[mask]
     corrected, line, notes = baseline_correct(x, y, region.baseline)
     f = settings.fit
-    centers, picked = pick_peaks(x, corrected, f)
+    manual = settings.analysis_method == 'lorentzian_manual'
+    centers, picked = manual_peak_guesses(x, corrected, region) if manual else pick_peaks(x, corrected, f)
     n = len(centers)
     if n > f.max_peaks:
         raise ValueError(f'{region.name}: найдено {n} пиков (лимит {f.max_peaks}). '
                          'Повысьте threshold/разделение или сузьте область.')
     if not n:
+        if manual:
+            raise ValueError(f'{region.name}: сначала отметьте ручные пики.')
         return FitResult(region.name, x, y, line, corrected, centers, picked,
                          np.array([]), np.array([]), np.zeros_like(y), True,
                          notes + ['Пики выше threshold не найдены; интеграл = 0.'],
                          {'n_peaks': 0, 'nfev': 0, 'relative_rmse': None})
-    if len(x) <= 2*n:
-        raise ValueError(f'{region.name}: недостаточно точек для {2*n} параметров.')
+    parameter_count = (3 if manual else 2)*n
+    if len(x) <= parameter_count:
+        raise ValueError(f'{region.name}: недостаточно точек для {parameter_count} параметров.')
     scale = max(float(np.max(np.abs(corrected))), np.finfo(float).tiny)
     target, initial_amp = corrected / scale, picked / scale
+    if not f.signed:
+        initial_amp = np.maximum(initial_amp, 1e-6)
+        if manual and np.any(picked <= 0):
+            notes.append('Начальная высота ручного пика неположительна; проверьте фазу, базовую линию или разрешите отрицательные амплитуды.')
     spacing = float(np.median(np.diff(x)))
     # A width appreciably below digitization resolution is unidentifiable.
     lower_w = max(f.min_width_hz / (2*spectrum.sf_mhz), spacing * .25)
@@ -582,24 +611,45 @@ def fit_region(spectrum: Spectrum, region: FitRegion, settings: Session) -> FitR
         raise ValueError('Максимальная ширина меньше цифрового разрешения спектра.')
     initial_w = max(settings.processing.lb_hz, f.initial_width_hz) / (2*spectrum.sf_mhz)
     initial_w = np.clip(initial_w, lower_w*1.01, upper_w*.99)
-    distances = (x[:, None] - centers[None, :])**2
+    seed_centers = centers.copy()
+    center_unit = f.center_tolerance_ppm if manual else 1.
+    if manual:
+        # Midpoints keep component identities ordered and prevent center swaps.
+        middle = (centers[:-1]+centers[1:])/2
+        center_low = np.maximum(centers-center_unit, np.r_[region.low, middle])
+        center_high = np.minimum(centers+center_unit, np.r_[middle, region.high])
+    fixed_distances = None if manual else (x[:, None]-seed_centers[None, :])**2
     def model_jac(params, jac=False):
-        amp, widths = params[:n], np.exp(params[n:])
+        amp, widths = params[:n], np.exp(params[n:2*n])
+        if manual:
+            current_centers = seed_centers+params[2*n:]*center_unit
+            delta = x[:, None]-current_centers[None, :]
+            distances = delta**2
+        else:
+            distances = fixed_distances
         w2 = widths**2
         profile = w2 / (distances + w2)
         if jac:
             dlogw = amp * 2*w2 * distances / (distances + w2)**2
-            return np.concatenate([profile, dlogw], axis=1)
+            columns = [profile, dlogw]
+            if manual:
+                columns.append(amp*2*w2*delta/(distances+w2)**2*center_unit)
+            return np.concatenate(columns, axis=1)
         return profile @ amp
     lower_amp = np.full(n, -np.inf if f.signed else 0.)
     lower = np.r_[lower_amp, np.full(n, np.log(lower_w))]
     upper = np.r_[np.full(n, np.inf), np.full(n, np.log(upper_w))]
+    if manual:
+        lower = np.r_[lower, (center_low-seed_centers)/center_unit]
+        upper = np.r_[upper, (center_high-seed_centers)/center_unit]
     candidates = []
     failures = []
     for attempt in range(f.restarts):
         factor = (1., .5, 2., .25, 4.)[attempt % 5]
         width0 = np.clip(initial_w*factor, lower_w*1.001, upper_w*.999)
         start = np.r_[initial_amp, np.full(n, np.log(width0))]
+        if manual:
+            start = np.r_[start, np.zeros(n)]
         try:
             result = least_squares(lambda z: model_jac(z)-target, start,
                                    jac=lambda z: model_jac(z, True), bounds=(lower, upper),
@@ -614,7 +664,9 @@ def fit_region(spectrum: Spectrum, region: FitRegion, settings: Session) -> FitR
     good = [r for r in candidates if r.success and np.isfinite(r.x).all()]
     result = min(good or candidates, key=lambda r: r.cost)
     amplitudes = result.x[:n] * scale
-    widths = np.exp(result.x[n:])
+    widths = np.exp(result.x[n:2*n])
+    if manual:
+        centers = seed_centers+result.x[2*n:]*center_unit
     fitted = model_jac(result.x) * scale
     components = lorentzian(x[:, None], centers[None, :], widths[None, :], amplitudes[None, :])
     cancellation = cancellation_diagnostics(components, centers, amplitudes, f.cancellation_warning)
@@ -630,6 +682,13 @@ def fit_region(spectrum: Spectrum, region: FitRegion, settings: Session) -> FitR
                        condition_number=cond if np.isfinite(cond) else None, cancellation_fraction=total_cancel,
                        cancellation_pairs=cancellation,
                        initial_width_ppm=float(initial_w), width_bounds_ppm=[lower_w, upper_w])
+    if manual:
+        diagnostics.update(method='lorentzian_manual', initial_centers_ppm=seed_centers.tolist(),
+                           center_bounds_ppm=np.column_stack([center_low, center_high]).tolist(),
+                           center_shifts_ppm=(centers-seed_centers).tolist(),
+                           center_tolerance_ppm=f.center_tolerance_ppm)
+        if np.any(np.minimum(centers-center_low, center_high-centers) < .02*(center_high-center_low)):
+            notes.append('Центр ручного пика достиг границы допуска; проверьте разметку и выравнивание.')
     if not result.success:
         notes.append('ОПТИМИЗАЦИЯ НЕ СОШЛАСЬ: ' + str(result.message))
     if rmse > f.residual_warning:
@@ -926,6 +985,9 @@ def load_batch_results(csv_path):
 
 def batch_analyze(root, session: Session, csv_path, progress: Callable | None = None,
                   cancelled: Callable | None = None, recursive=True):
+    if session.analysis_method == 'lorentzian_manual':
+        session = copy.deepcopy(session)
+        session.alignment.enabled = True
     session.validate(require_regions=True)
     paths = discover_spectra(root, recursive, session.processing.source_mode, session.processing.pdata_procno)
     if not paths:

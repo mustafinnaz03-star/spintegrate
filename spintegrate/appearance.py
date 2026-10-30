@@ -17,6 +17,7 @@ class AppearanceSettings:
     export_format: str = 'png'
     export_layout: str = 'full'
     export_region_names: bool = False
+    ui_scale_percent: int = 100
 
 
 def validate_color(color):
@@ -29,6 +30,8 @@ def area_color(area, index=0):
 
 
 def validate_appearance(a):
+    if type(a.ui_scale_percent) is not int or a.ui_scale_percent not in (80, 90, 100, 110, 125, 150):
+        raise ValueError('Масштаб интерфейса: 80, 90, 100, 110, 125 или 150%.')
     if a.language not in ('ru', 'en') or a.export_language not in ('auto', 'ru', 'en'):
         raise ValueError('Язык должен быть ru или en.')
     if a.export_format not in ('png', 'tiff', 'svg') or a.export_layout not in ('full', 'fit', 'region'):

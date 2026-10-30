@@ -5,6 +5,7 @@ import copy
 import csv
 import json
 import queue
+import re
 import threading
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
@@ -13,14 +14,14 @@ from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import numpy as np
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
 
 from .core import (BASELINE_METHODS, PHASE_MODES, BaselineSettings, FitRegion,
                    IntegrationRegion, Session, analyze, baseline_correct,
                    batch_analyze, discover_spectra, load_analysis, load_batch_results,
-                   direct_region, load_source, PhaseState, ProcessingSettings, pick_peaks, process, save_analysis,
+                   direct_region, load_source, PhaseState, ProcessingSettings, pick_peaks, manual_peak_guesses, process, save_analysis,
                    validate_baseline, window_reference_index, write_batch_csv)
 from .demo import demo_raw, demo_session, write_demo_series, write_pdata_demo_series
 from .plotting import draw_spectrum
@@ -32,13 +33,17 @@ from .baseline_ui import BaselineControls
 from .region_editing import RegionHistory, move_or_resize
 from .alignment import AlignmentSettings, align_regions, align_spectrum
 from .navigation import PlotNavigation
+from .desktop_display import (SURFACE, UI_SCALES, SpectrumCanvas, apply_style, display_factor, enable_windows_dpi,
+                              fit_window, scale_explicit_fonts, style_live_figure)
 
 
 PHASE_LABELS = {'Без коррекции': 'none', 'ACME (nmrglue)': 'acme',
                 'Peak minima (nmrglue)': 'peak_minima', 'abs': 'abs'}
 REF_LABELS = {'Из метаданных Bruker': 'metadata', 'Самый сильный пик': 'strongest',
               'Пик в заданном ppm-окне': 'window'}
-ANALYSIS_LABELS = {'Деконволюция Лоренцами': 'lorentzian', 'Прямое интегрирование областей': 'direct'}
+ANALYSIS_LABELS = {'Деконволюция Лоренцами': 'lorentzian',
+                   'Лоренцы: ручной выбор пиков': 'lorentzian_manual',
+                   'Прямое интегрирование областей': 'direct'}
 WHEEL_MODES = {'Интенсивность': 'intensity', 'Масштаб ppm': 'ppm', 'Фаза P0': 'phase_p0', 'Фаза P1': 'phase_p1'}
 ALIGNMENT_MODES = {'Единый сдвиг спектра': 'global', 'По областям обработки': 'regions'}
 
@@ -117,15 +122,24 @@ class AlignmentControls(ttk.LabelFrame):
         self.refresh_states()
 
     def refresh_states(self):
-        self.enabled_check.configure(state='disabled' if self.app.batch_running else 'normal')
+        required = self.required()
+        if required and not self.vars['enabled'].get():
+            loading, self.loading = self.loading, True
+            self.vars['enabled'].set(True)
+            self.loading = loading
+        self.enabled_check.configure(state='disabled' if self.app.batch_running or required else 'normal')
         enabled = self.vars['enabled'].get() and not self.app.batch_running
         self.combo.configure(state='readonly' if enabled else 'disabled')
         for key, entry in self.entries.items():
             active = enabled and (key not in ('low_ppm', 'high_ppm') or ALIGNMENT_MODES[canonical(self.vars['mode'].get())] == 'global')
             entry.configure(state='normal' if active else 'disabled')
 
-    def read(self, default):
-        if not self.vars['enabled'].get():
+    def required(self):
+        return (self.app.session.analysis_method == 'lorentzian_manual' or
+                bool(self.app.batch_recipe and self.app.batch_recipe.analysis_method == 'lorentzian_manual'))
+
+    def read(self, default, required=False):
+        if not self.vars['enabled'].get() and not required:
             result = copy.deepcopy(default)
             result.enabled = False
             return result
@@ -147,7 +161,7 @@ class AlignmentControls(ttk.LabelFrame):
             return
         self.refresh_states()
         try:
-            settings = self.read(self.app.session.alignment)
+            settings = self.read(self.app.session.alignment, required=self.required())
             self.app.session.alignment = settings
             if self.app.batch_recipe is not None:
                 self.app.batch_recipe.alignment = copy.deepcopy(settings)
@@ -166,7 +180,8 @@ class FieldPanel(ttk.Frame):
 
     def add(self, key, label, value, choices=None, kind=float, hint=None):
         row = len(self.vars)*2
-        ttk.Label(self, text=label).grid(row=row, column=0, sticky='w', padx=(0, 8), pady=3)
+        ttk.Label(self, text=label, wraplength=round(185*display_factor(self))).grid(
+            row=row, column=0, sticky='w', padx=(0, 8), pady=3)
         var = tk.BooleanVar(value=value) if kind is bool else tk.StringVar(value=str(value))
         if kind is bool:
             widget = ttk.Checkbutton(self, variable=var)
@@ -238,7 +253,7 @@ class ScrollPanel(ttk.Frame):
     """Scrollable settings page for smaller screens / enlarged Windows fonts."""
     def __init__(self, parent):
         super().__init__(parent)
-        self.canvas = tk.Canvas(self, highlightthickness=0, background='#dcdad5')
+        self.canvas = tk.Canvas(self, highlightthickness=0, background=SURFACE)
         scrollbar = ttk.Scrollbar(self, orient='vertical', command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side='right', fill='y')
@@ -275,15 +290,12 @@ class SpintegrateApp:
         self.language = 'ru'
         root._spintegrate_language = self.language
         root.title('Spintegrate — анализ из pdata' if source_mode == 'pdata' else 'Spintegrate — анализ спектров ЯМР (raw)')
-        available_width, available_height = max(700, root.winfo_screenwidth()-80), max(500, root.winfo_screenheight()-100)
-        root.geometry(f'{min(1400, available_width)}x{min(920, available_height)}')
-        root.minsize(min(1080, available_width), min(750, available_height))
-        style = ttk.Style(root)
-        style.theme_use('clam')
-        style.configure('.', font=('Segoe UI', 10))
-        style.configure('TNotebook.Tab', padding=(12, 7))
-        style.configure('Treeview', rowheight=25, font=('Segoe UI', 9))
         self.session = Session()
+        if parent_app:
+            self.session.appearance.ui_scale_percent = parent_app.session.appearance.ui_scale_percent
+        apply_style(root, self.session.appearance.ui_scale_percent)
+        fit_window(root)
+        self.ui_scale_var = tk.StringVar(root, value=f'{self.session.appearance.ui_scale_percent}%')
         self.session.processing.source_mode = source_mode
         if source_mode == 'pdata':
             self.session.processing.lb_hz = 0.
@@ -316,6 +328,10 @@ class SpintegrateApp:
         self._region_event_timers = set()
         self.region_history = RegionHistory()
         self.region_dragging = False
+        self.manual_peak_edit = tk.BooleanVar(root, value=False)
+        self.manual_peak_history = []
+        self.manual_peak_text = tk.StringVar(root)
+        self._manual_peak_entry_region = None
         self.wheel_mode = tk.StringVar(root, value='Интенсивность')
         self.wheel_controls = []
         self.phase_pivot_armed = False
@@ -341,6 +357,11 @@ class SpintegrateApp:
         language_combo.bind('<<ComboboxSelected>>', lambda _: self.set_language(
                             'en' if self.language_var.get() == 'English' else 'ru'))
         ttk.Label(top, text='Язык / Language').pack(side='right')
+        scale_combo = ttk.Combobox(top, textvariable=self.ui_scale_var,
+                                  values=[f'{v}%' for v in UI_SCALES], state='readonly', width=5)
+        scale_combo.pack(side='right', padx=6)
+        scale_combo.bind('<<ComboboxSelected>>', lambda _: self.set_display_scale())
+        ttk.Label(top, text='Масштаб UI').pack(side='right')
         self.tabs = ttk.Notebook(self.root)
         self.tabs.pack(fill='both', expand=True, padx=10)
         self.single_tab, self.batch_tab = ttk.Frame(self.tabs), ttk.Frame(self.tabs)
@@ -354,7 +375,7 @@ class SpintegrateApp:
             ttk.Button(source, text='Открыть NPZ…', command=self.open_npz).pack(side='left', padx=3)
         ttk.Button(source, text='Демо', command=self.load_demo).pack(side='left', padx=3)
         ttk.Button(source, text='Аподизация / базовая линия…', command=self.open_preprocess).pack(side='left', padx=8)
-        self.fit_button = ttk.Button(source, text='Выполнить анализ', command=self.run_analysis)
+        self.fit_button = ttk.Button(source, text='Выполнить анализ', command=self.run_analysis, style='Accent.TButton')
         self.fit_button.pack(side='left', padx=4)
         actions = ttk.Frame(self.single_tab, padding=(8, 0, 8, 6))
         actions.pack(fill='x')
@@ -362,12 +383,17 @@ class SpintegrateApp:
         alternative = 'raw' if self.source_mode == 'pdata' else 'pdata'
         ttk.Button(actions, text='Анализировать raw…' if alternative == 'raw' else 'Анализировать pdata…',
                    command=lambda: self.open_source_window(alternative)).pack(side='left', padx=4)
+        self.sidebar_button = ttk.Button(actions, text='Скрыть настройки', command=self.toggle_sidebar)
+        self.sidebar_button.pack(side='left', padx=4)
+        ttk.Button(actions, text='Развернуть окно', command=self.maximize_window).pack(side='left', padx=4)
         ttk.Button(actions, text='Запомнить → серия', command=self.remember_for_batch).pack(side='right', padx=4)
         self.source_label = ttk.Label(self.single_tab, text='Спектр не загружен', foreground='#65758a')
         self.source_label.pack(fill='x', padx=12, pady=(0, 6))
-        split = ttk.Panedwindow(self.single_tab, orient='horizontal')
+        split = self.main_split = ttk.Panedwindow(self.single_tab, orient='horizontal')
         split.pack(fill='both', expand=True)
-        left, right = ttk.Frame(split, width=410), ttk.Frame(split)
+        left, right = ttk.Frame(split, width=round(385*display_factor(self.root))), ttk.Frame(split)
+        self.settings_sidebar, self.sidebar_visible = left, True
+        left.pack_propagate(False)
         split.add(left, weight=0)
         split.add(right, weight=1)
         control_tabs = ttk.Notebook(left)
@@ -436,6 +462,8 @@ class SpintegrateApp:
         add('initial_width_hz', 'Initial FWHM, Гц', f.initial_width_hz)
         add('min_width_hz', 'Минимум FWHM, Гц', f.min_width_hz)
         add('max_width_hz', 'Максимум FWHM, Гц', f.max_width_hz)
+        add('center_tolerance_ppm', 'Допуск центра ±, ppm', f.center_tolerance_ppm,
+            hint='Для ручных пиков: допустимое остаточное смещение после выравнивания.')
         add('max_nfev', 'Лимит вычислений / попытку', f.max_nfev, kind=int)
         add('restarts', 'Попытки с разными ширинами', f.restarts, kind=int)
         add('max_peaks', 'Максимум пиков / область', f.max_peaks, kind=int)
@@ -460,18 +488,34 @@ class SpintegrateApp:
         frame.pack(fill='both', expand=True, padx=6, pady=8)
         set_text(self.result_text, 'После анализа здесь появятся остаток, ограничения ширин, '
                  'сходимость и обнаруженные пары компенсирующихся линий.')
-        self.figure = Figure(figsize=(9, 7), dpi=100, facecolor='white')
-        grid = self.figure.add_gridspec(3, 1, height_ratios=(1, 2, .65), hspace=.4)
+        self.figure = Figure(figsize=(9, 7), dpi=100, facecolor='white', layout='constrained')
+        grid = self.figure.add_gridspec(3, 1, height_ratios=(1, 2.5, .7))
         self.overview_ax = self.figure.add_subplot(grid[0])
         self.detail_ax = self.figure.add_subplot(grid[1])
         self.residual_ax = self.figure.add_subplot(grid[2], sharex=self.detail_ax)
-        self.figure.subplots_adjust(left=.09, right=.98, top=.95, bottom=.08)
         WheelControls(right, self, lambda: self.navigation.reset()).pack(fill='x')
-        self.canvas = FigureCanvasTkAgg(self.figure, master=right)
+        self.manual_peak_controls = ttk.Frame(right, padding=4)
+        peak_row = ttk.Frame(self.manual_peak_controls)
+        peak_row.pack(fill='x')
+        ttk.Checkbutton(peak_row, text='Размечать пики', variable=self.manual_peak_edit,
+                        command=self.toggle_manual_peaks).pack(side='left')
+        ttk.Button(peak_row, text='Отменить пик', command=self.undo_manual_peaks).pack(side='left', padx=4)
+        ttk.Button(peak_row, text='Очистить пики', command=lambda: self.set_manual_peaks([])).pack(side='left')
+        self.manual_peak_label = ttk.Label(peak_row)
+        self.manual_peak_label.pack(side='left', padx=6)
+        peak_entry_row = ttk.Frame(self.manual_peak_controls)
+        peak_entry_row.pack(fill='x')
+        ttk.Label(peak_entry_row, text='Начальные ppm:').pack(side='left')
+        self.manual_peak_entry = ttk.Entry(peak_entry_row, textvariable=self.manual_peak_text)
+        self.manual_peak_entry.pack(side='left', fill='x', expand=True, padx=4)
+        self.manual_peak_entry.bind('<Return>', lambda _: self.apply_manual_peak_text())
+        ttk.Button(peak_entry_row, text='Применить пики', command=self.apply_manual_peak_text).pack(side='left')
+        self.canvas = SpectrumCanvas(self.figure, master=right)
         self.toolbar = SpectrumToolbar(self.canvas, right)
         self.toolbar.update()
         self.canvas.mpl_connect('key_press_event', self.region_edit_key)
         self.canvas.mpl_connect('button_press_event', self.pick_phase_pivot)
+        self.canvas.mpl_connect('button_press_event', self.on_manual_peak_click)
         self.selectors = []
         self.selection_label = ttk.Label(right, text='Во вкладке «Области» выберите режим, '
                                         'затем выделите диапазон мышью на графике.')
@@ -622,6 +666,8 @@ class SpintegrateApp:
 
     def _sync_widgets(self):
         self.region_history.clear()
+        self.manual_peak_history.clear()
+        self.manual_peak_edit.set(False)
         self.region_dragging = False
         self.phase_pivot_armed = False
         self.loading_settings = True
@@ -642,9 +688,52 @@ class SpintegrateApp:
             self.preprocess_window.load_settings()
         if self.language != self.session.appearance.language:
             self.set_language(self.session.appearance.language)
+        self.set_display_scale(self.session.appearance.ui_scale_percent)
 
     def t(self, text):
         return tr(text, self.language)
+
+    def set_display_scale(self, percent=None):
+        percent = int(self.ui_scale_var.get().rstrip('%')) if percent is None else percent
+        if percent not in UI_SCALES:
+            return
+        owner = self
+        while owner.parent_app:
+            owner = owner.parent_app
+        workspaces = list(dict.fromkeys([owner, *owner.source_windows, self]))
+        apply_style(owner.root, percent)
+        for workspace in workspaces:
+            if workspace.closed:
+                continue
+            workspace.session.appearance.ui_scale_percent = percent
+            workspace.ui_scale_var.set(f'{percent}%')
+            scale_explicit_fonts(workspace.root, percent)
+            if hasattr(workspace, 'settings_sidebar'):
+                workspace.settings_sidebar.configure(width=round(385*display_factor(workspace.root)*percent/100.))
+            if hasattr(workspace, 'navigation'):
+                workspace.draw(local=workspace.preview_local)
+                popup = workspace.preprocess_window
+                if popup and popup.window.winfo_exists() and popup.cached_result:
+                    popup.draw_cached()
+                for review in workspace.review_windows:
+                    if review.window.winfo_exists():
+                        review.draw()
+
+    def toggle_sidebar(self):
+        if self.sidebar_visible:
+            self._sidebar_width = self.settings_sidebar.winfo_width()
+            self.main_split.forget(self.settings_sidebar)
+        else:
+            self.main_split.insert(0, self.settings_sidebar, weight=0)
+            self.main_split.sashpos(0, getattr(self, '_sidebar_width', round(385*display_factor(self.root))))
+        self.sidebar_visible = not self.sidebar_visible
+        set_label(self.sidebar_button, 'Скрыть настройки' if self.sidebar_visible else 'Показать настройки')
+
+    def maximize_window(self):
+        try:
+            self.root.state('normal' if self.root.state() == 'zoomed' else 'zoomed')
+        except tk.TclError:
+            fit_window(self.root)
 
     def set_language(self, language):
         if language not in ('ru', 'en'):
@@ -693,7 +782,6 @@ class SpintegrateApp:
         if self.preprocess_window and self.preprocess_window.window.winfo_exists():
             self.preprocess_window.store_controls()
         s = copy.deepcopy(self.session)
-        s.alignment = self.alignment_controls.read(s.alignment)
         p = self.processing_fields.values()
         p['phase'] = PHASE_LABELS[canonical(p.pop('phase_label'))]
         p['reference_mode'] = REF_LABELS[canonical(p.pop('reference_label'))]
@@ -702,10 +790,15 @@ class SpintegrateApp:
         s.processing.source_mode = self.source_mode
         s.processing.abs_source = 'spectrum'
         s.analysis_method = ANALYSIS_LABELS[canonical(self.fit_fields.vars['analysis_label'].get())]
-        if s.analysis_method == 'lorentzian':
-            for k, v in self.fit_fields.values().items():
-                if k != 'analysis_label':
-                    setattr(s.fit, k, v)
+        s.alignment = self.alignment_controls.read(s.alignment, required=s.analysis_method == 'lorentzian_manual')
+        if s.analysis_method != 'direct':
+            for k, variable in self.fit_fields.vars.items():
+                if k == 'analysis_label' or (k in ('threshold', 'min_separation_points') and s.analysis_method == 'lorentzian_manual') or (k == 'center_tolerance_ppm' and s.analysis_method != 'lorentzian_manual'):
+                    continue
+                try:
+                    setattr(s.fit, k, self.fit_fields.types[k](variable.get()))
+                except (ValueError, tk.TclError):
+                    raise ValueError(f'Проверьте значение поля «{k}».') from None
         s.validate()
         return s
 
@@ -777,6 +870,7 @@ class SpintegrateApp:
     def arm_phase_pivot(self):
         if self.raw is None:
             return self.error('Сначала загрузите спектр.')
+        self.manual_peak_edit.set(False)
         if PHASE_LABELS[canonical(self.processing_fields.vars['phase_label'].get())] == 'abs':
             self.status.set('Ручная фазировка недоступна в режиме abs.')
             return
@@ -881,16 +975,120 @@ class SpintegrateApp:
         self.status.set('Определяю референс по выбранному спектру…')
         self.submit('anchor_reference', work, ready, self.generation)
 
+    def refresh_manual_peaks(self):
+        if not hasattr(self, 'manual_peak_label'):
+            return
+        region = next((r for r in self.session.regions if r.name == self.selected_region), None)
+        label = f'{region.name}: {len(region.manual_peaks)} пиков' if region else 'Сначала выберите область обработки.'
+        set_label(self.manual_peak_label, label)
+        # Do not overwrite an unapplied numeric draft while its entry has focus.
+        name = region.name if region else None
+        if name != self._manual_peak_entry_region or self.root.focus_get() is not self.manual_peak_entry:
+            self.manual_peak_text.set('; '.join(f'{v:.8g}' for v in sorted(region.manual_peaks)) if region else '')
+            self._manual_peak_entry_region = name
+
+    def toggle_manual_peaks(self):
+        if self.manual_peak_edit.get():
+            self.edit_regions.set(False)
+            self.region_dragging = False
+            self.phase_pivot_armed = False
+            if self.toolbar.mode:
+                self.toolbar.zoom() if 'zoom rect' in str(self.toolbar.mode) else self.toolbar.pan()
+        self.draw(local=self.preview_local)
+
+    def set_manual_peaks(self, peaks, record=True):
+        try:
+            recipe = self.read_settings()
+            region = next((r for r in recipe.regions if r.name == self.selected_region), None)
+            if region is None:
+                raise ValueError('Сначала выберите область обработки.')
+            old = list(region.manual_peaks)
+            region.manual_peaks = sorted(float(v) for v in peaks)
+            recipe.validate()
+            if old == region.manual_peaks:
+                return
+            if record:
+                self.manual_peak_history.append((region.name, old))
+                del self.manual_peak_history[:-30]
+            self.session = recipe
+            self.manual_peak_text.set('; '.join(f'{v:.8g}' for v in region.manual_peaks))
+            self.invalidate()
+            self.draw()
+            self.schedule_preview()
+        except ValueError as exc:
+            self.status.set(str(exc))
+
+    def apply_manual_peak_text(self):
+        try:
+            self.set_manual_peaks([float(v) for v in re.split(r'[;,\s]+', self.manual_peak_text.get().strip()) if v])
+        except ValueError:
+            self.status.set('Введите ppm через точку с запятой; десятичный разделитель — точка.')
+
+    def undo_manual_peaks(self):
+        if not self.manual_peak_history:
+            return
+        name, peaks = self.manual_peak_history[-1]
+        if name != self.selected_region:
+            self.status.set('Для отмены выберите область последнего изменённого пика.')
+            return
+        self.manual_peak_history.pop()
+        self.set_manual_peaks(peaks, record=False)
+
+    def on_manual_peak_click(self, event):
+        if (not self.manual_peak_edit.get() or self.session.analysis_method != 'lorentzian_manual'
+                or self.phase_pivot_armed or self.toolbar.mode or event.dblclick
+                or event.inaxes not in (self.overview_ax, self.detail_ax) or event.xdata is None
+                or event.button not in (1, 3) or self.spectrum is None):
+            return
+        region = next((r for r in self.session.regions if r.name == self.selected_region), None)
+        if region is None:
+            self.status.set('Сначала выберите область обработки.')
+            return
+        peaks = list(region.manual_peaks)
+        if event.button == 1:
+            if not region.low < event.xdata < region.high:
+                self.status.set('Отметьте пик внутри выбранной области обработки.')
+                return
+            spacing = float(np.median(np.diff(self.spectrum.ppm)))
+            if any(abs(v-event.xdata) < spacing*.25 for v in peaks):
+                return
+            peaks.append(float(event.xdata))
+        elif peaks:
+            pixels = event.inaxes.transData.transform(np.column_stack([peaks, np.zeros(len(peaks))]))[:, 0]
+            nearest = int(np.argmin(abs(pixels-event.x)))
+            if abs(pixels[nearest]-event.x) > 14:
+                return
+            peaks.pop(nearest)
+        self.set_manual_peaks(peaks)
+
     def update_analysis_controls(self):
         mode = ANALYSIS_LABELS[canonical(self.fit_fields.vars['analysis_label'].get())]
         self.session.analysis_method = mode
         for key in self.fit_fields.vars:
             if key != 'analysis_label':
-                self.fit_fields.enable(key, mode == 'lorentzian')
+                active = mode != 'direct'
+                if key in ('threshold', 'min_separation_points'):
+                    active = mode == 'lorentzian'
+                if key == 'center_tolerance_ppm':
+                    active = mode == 'lorentzian_manual'
+                self.fit_fields.enable(key, active)
+        if hasattr(self, 'manual_peak_controls'):
+            if mode == 'lorentzian_manual':
+                self.session.alignment.enabled = True
+                self.alignment_controls.vars['enabled'].set(True)
+                self.manual_peak_controls.pack(before=self.canvas.get_tk_widget(), fill='x')
+            else:
+                self.manual_peak_controls.pack_forget()
+                self.manual_peak_edit.set(False)
+            self.alignment_controls.refresh_states()
+            self.refresh_manual_peaks()
         if hasattr(self, 'fit_hint'):
             if mode == 'direct':
                 text = ('Прямой интеграл = ∫ I(ppm) dppm после локальной коррекции базовой линии. '
                         'Поиск пиков и подгонка не выполняются. Отрицательные сигналы дают отрицательный вклад.')
+            elif mode == 'lorentzian_manual':
+                text = ('Отметьте пики в каждой области. Центры, амплитуды и ширины оптимизируются. '
+                        'В серии выравнивание обязательно. Интеграл = Σ A × HWHM по итоговым центрам.')
             else:
                 text = ('Центры фиксированы по peak-picking.\nШирина модели = HWHM (ppm); '
                         'старт = max(LB, initial FWHM) / (2 × SFO1).\nИнтеграл = Σ A × HWHM; '
@@ -1068,7 +1266,8 @@ class SpintegrateApp:
                     mask = (spectrum.ppm >= selected.low) & (spectrum.ppm <= selected.high)
                     x, y = spectrum.ppm[mask], spectrum.intensity[mask]
                     corrected, baseline, notes = baseline_correct(x, y, selected.baseline)
-                    peaks = pick_peaks(x, corrected, recipe.fit)
+                    peaks = (manual_peak_guesses(x, corrected, selected) if recipe.analysis_method == 'lorentzian_manual'
+                             else pick_peaks(x, corrected, recipe.fit))
                 local = (x, y, corrected, baseline, peaks, notes)
             return spectrum, local
         def ready(result):
@@ -1117,7 +1316,20 @@ class SpintegrateApp:
         self.selectors.clear()
         draw_spectrum(self.overview_ax, self.detail_ax, self.residual_ax, self.spectrum,
                       self.session, self.selected_region, self.analysis, local, language=self.language)
+        style_live_figure(self.figure, self.session.appearance.ui_scale_percent, shared_labels=True)
+        self.refresh_manual_peaks()
         if self.spectrum is not None:
+            if self.manual_peak_edit.get() and self.session.analysis_method == 'lorentzian_manual':
+                set_label(self.selection_label, 'Ручные пики: левая кнопка добавляет, правая удаляет ближайший. Ctrl+Z — отмена; Esc — закончить.')
+                self.draw_phase_pivot((self.overview_ax, self.detail_ax), self.spectrum)
+                self.navigation.after_draw()
+                self.canvas.draw_idle()
+                return
+            if not self.edit_regions.get():
+                set_label(self.selection_label,
+                    'Включите «Размечать пики» для кликов; выключите для выбора областей мышью.'
+                    if self.session.analysis_method == 'lorentzian_manual' else
+                    'Выделение мышью заполняет границы новой области.')
             kind = self.selection_mode.get()
             if kind == 'integral':
                 selected = self.area_tree.selection()
@@ -1163,6 +1375,8 @@ class SpintegrateApp:
             self.toggle_region_editing()
 
     def toggle_region_editing(self):
+        if self.edit_regions.get():
+            self.manual_peak_edit.set(False)
         self.region_dragging = False
         self.restore_region_bound_fields()
         if not self.edit_regions.get():
@@ -1193,6 +1407,7 @@ class SpintegrateApp:
                 return
             self.region_history.record(recipe)
             self.session = edited
+            self.manual_peak_history.clear()
             if self.preprocess_window:
                 self.preprocess_window.load_settings()
             self.refresh_regions()
@@ -1217,6 +1432,7 @@ class SpintegrateApp:
             return
         try:
             self.session = self.region_history.undo(self.read_settings())
+            self.manual_peak_history.clear()
             selected = self.area_tree.selection() if self.selection_mode.get() == 'integral' else ()
             if self.preprocess_window:
                 self.preprocess_window.load_settings()
@@ -1235,6 +1451,14 @@ class SpintegrateApp:
             self.status.set(str(exc))
 
     def region_edit_key(self, event):
+        if self.manual_peak_edit.get():
+            if event.key == 'escape':
+                self.manual_peak_edit.set(False)
+                self.draw(local=self.preview_local)
+                return
+            if event.key in ('ctrl+z', 'cmd+z'):
+                self.undo_manual_peaks()
+                return
         if event.key == 'escape' and self.phase_pivot_armed:
             self.phase_pivot_armed = False
             self.draw(local=self.preview_local)
@@ -1360,6 +1584,7 @@ class SpintegrateApp:
             if isinstance(new, FitRegion):
                 previous = next(r for r in s.regions if r.name == old)
                 new.baseline = previous.baseline
+                new.manual_peaks = list(previous.manual_peaks)
                 s.regions = [new if r.name == old else r for r in s.regions]
                 for area in s.integrals:
                     if area.parent == old:
@@ -1370,6 +1595,7 @@ class SpintegrateApp:
             s.validate()
             self.session = s
             self.region_history.clear()
+            self.manual_peak_history.clear()
             self.refresh_regions()
             self.invalidate()
             self.preview()
@@ -1432,6 +1658,7 @@ class SpintegrateApp:
         self.session.regions = [r for r in self.session.regions if r.name != name]
         self.session.integrals = [r for r in self.session.integrals if r.parent != name]
         self.region_history.clear()
+        self.manual_peak_history.clear()
         self.refresh_regions()
         self.invalidate()
         self.preview()
@@ -1489,7 +1716,10 @@ class SpintegrateApp:
                 continue
             lines.append(f"{name}: {len(result.centers)} пиков; сошлось={result.success}")
             lines.append(f"RMSE={d.get('relative_rmse')}; nfev={d.get('nfev')}; condition={d.get('condition_number')}")
-            lines.append(' №     ppm (фикс.)   A            HWHM ppm     A×HWHM')
+            lines.append(' №     ppm (оптим.)  A            HWHM ppm     A×HWHM' if analysis.method == 'lorentzian_manual' else
+                         ' №     ppm (фикс.)   A            HWHM ppm     A×HWHM')
+            if analysis.method == 'lorentzian_manual':
+                lines.append('Начальные ppm: ' + ', '.join(f'{v:.6f}' for v in d.get('initial_centers_ppm', [])))
             for i, (c, a, w) in enumerate(zip(result.centers, result.amplitudes, result.widths), 1):
                 lines.append(f'{i:2}  {c:11.6f} {a:12.5g} {w:12.5g} {a*w:12.5g}')
             lines.append('')
@@ -1543,6 +1773,7 @@ class SpintegrateApp:
             recipe.validate(require_regions=True)
             self.session = recipe
             self.batch_recipe = copy.deepcopy(recipe)
+            self.alignment_controls.set_values(recipe.alignment)
             self._recipe_description()
             self.tabs.select(self.batch_tab)
             self.status.set('Параметры запомнены для серии. Последующие изменения одиночного анализа не изменят этот снимок.')
@@ -1561,6 +1792,10 @@ class SpintegrateApp:
                  f'LB={s.processing.lb_hz:g} Гц; threshold={s.fit.threshold:g}. '
                  'Центры и амплитуды определяются заново в каждом спектре.' if s.analysis_method == 'lorentzian' else
                  f'Сохранено областей интегрирования: {len(s.integrals)}. Численный интеграл: интенсивность × ppm.')
+        if s.analysis_method == 'lorentzian_manual':
+            text = (f'Ручных пиков: {sum(len(r.manual_peaks) for r in s.regions)}; '
+                    f'допуск центра ±{s.fit.center_tolerance_ppm:g} ppm. Центры, амплитуды и ширины оптимизируются. '
+                    'Выравнивание в серии обязательно; интеграл = Σ A × HWHM.')
         p = s.processing
         reference = (('Исходная привязка ppm: метаданные каждого файла.' if s.alignment.enabled else
                       'Привязка серии: шкала каждого файла, без автоматического выравнивания.')
@@ -1591,7 +1826,8 @@ class SpintegrateApp:
             if not direct:
                 with Path(path).open('w', encoding='utf-8-sig', newline='') as stream:
                     writer = csv.writer(stream)
-                    writer.writerow(['region', 'peak', 'center_ppm_fixed', 'initial_amplitude',
+                    manual = self.analysis.method == 'lorentzian_manual'
+                    writer.writerow(['region', 'peak', 'center_ppm_optimized' if manual else 'center_ppm_fixed', 'initial_amplitude',
                                      'amplitude', 'hwhm_ppm', 'fwhm_hz', 'amplitude_x_hwhm', 'converged'])
                     for name, result in self.analysis.results.items():
                         for i, (c, a0, a, w) in enumerate(zip(result.centers, result.initial_amplitudes,
@@ -1676,7 +1912,7 @@ class SpintegrateApp:
             return self.error('Сначала «Запомнить → серия» или загрузить JSON настроек.')
         try:
             recipe = copy.deepcopy(self.batch_recipe)
-            recipe.alignment = self.alignment_controls.read(recipe.alignment)
+            recipe.alignment = self.alignment_controls.read(recipe.alignment, required=recipe.analysis_method == 'lorentzian_manual')
             recipe.validate(require_regions=True)
             root = self.batch_root.get()
             paths = discover_spectra(root, self.batch_recursive.get(), recipe.processing.source_mode,
@@ -1893,8 +2129,7 @@ class FitReviewWindow:
         self.window = tk.Toplevel(app.root)
         self.window.title(('Проверка интегрирования — ' if analysis.method == 'direct' else
                            'Проверка фита Лоренцами — ') + Path(analysis.spectrum.source).name)
-        self.window.geometry('1170x900')
-        self.window.minsize(950, 700)
+        fit_window(self.window, 1500, 1050)
         ttk.Label(self.window, text=origin, wraplength=1100, padding=(10, 6),
                   foreground='#65758a').pack(fill='x')
         ttk.Label(self.window, text='Исходный спектр: ' + analysis.spectrum.source,
@@ -1913,18 +2148,18 @@ class FitReviewWindow:
         self.color_combo.pack(side='left', padx=4)
         ttk.Button(controls, text='Цвет области…', command=self.choose_color).pack(side='left', padx=4)
         ttk.Button(controls, text='Экспорт картинки…', command=self.save_image).pack(side='right', padx=4)
-        self.figure = Figure(figsize=(10, 6), dpi=100, facecolor='white')
-        grid = self.figure.add_gridspec(3, 1, height_ratios=(1, 2, .65), hspace=.4)
+        self.figure = Figure(figsize=(10, 6), dpi=100, facecolor='white', layout='constrained')
+        grid = self.figure.add_gridspec(3, 1, height_ratios=(1, 2.5, .7))
         self.overview_ax = self.figure.add_subplot(grid[0])
         self.detail_ax = self.figure.add_subplot(grid[1])
         self.residual_ax = self.figure.add_subplot(grid[2], sharex=self.detail_ax)
-        self.figure.subplots_adjust(left=.09, right=.98, top=.95, bottom=.08)
         plot_frame = ttk.Frame(self.window)
         plot_frame.pack(fill='both', expand=True)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
+        self.canvas = SpectrumCanvas(self.figure, master=plot_frame)
         self.toolbar = SpectrumToolbar(self.canvas, plot_frame)
         self.canvas.get_tk_widget().pack(fill='both', expand=True)
         self.toolbar.update()
+        scale_explicit_fonts(self.window, app.session.appearance.ui_scale_percent)
         self.navigation = PlotNavigation(self.canvas, (self.overview_ax, self.detail_ax, self.residual_ax),
             lambda: (self.analysis.spectrum.ppm[0], self.analysis.spectrum.ppm[-1]))
         block, self.details = scrolled_text(self.window, 7)
@@ -1942,6 +2177,7 @@ class FitReviewWindow:
         draw_spectrum(self.overview_ax, self.detail_ax, self.residual_ax,
                       self.analysis.spectrum, self.recipe, name, self.analysis, component_limit=None,
                       language=self.app.language)
+        style_live_figure(self.figure, self.app.session.appearance.ui_scale_percent, shared_labels=True)
         self.navigation.after_draw()
         lines = [self.origin, 'Статус спектра: ' + self.analysis.status]
         metadata = self.analysis.spectrum.processing_metadata
@@ -1956,10 +2192,13 @@ class FitReviewWindow:
                 units = 'интенсивность × ppm' if self.analysis.method == 'direct' else 'Σ A × HWHM'
                 lines.append(f'Интеграл {area.name}: {value:.9g} ({units})')
         result = self.analysis.results.get(name)
-        if result and self.analysis.method == 'lorentzian':
+        if result and self.analysis.method != 'direct':
             d = result.diagnostics
             lines.append(f"RMSE: {d.get('relative_rmse')}; сошлось: {result.success}; nfev: {d.get('nfev')}")
-            lines.append(' №       ppm (фикс.)       A            HWHM ppm        A×HWHM')
+            lines.append(' №       ppm (оптим.)      A            HWHM ppm        A×HWHM' if self.analysis.method == 'lorentzian_manual' else
+                         ' №       ppm (фикс.)       A            HWHM ppm        A×HWHM')
+            if self.analysis.method == 'lorentzian_manual':
+                lines.append('Начальные ppm: ' + ', '.join(f'{v:.6f}' for v in d.get('initial_centers_ppm', [])))
             for i, (c, a, w) in enumerate(zip(result.centers, result.amplitudes, result.widths), 1):
                 lines.append(f'{i:3}  {c:14.7f} {a:14.6g} {w:14.6g} {a*w:14.6g}')
         elif result:
@@ -1991,11 +2230,14 @@ class ImageExportWindow:
         self.region = region or next(iter(analysis.results), recipe.regions[0].name)
         self.window = tk.Toplevel(app.root)
         self.window.title('Экспорт рисунка')
-        self.window.geometry('480x570')
-        self.window.resizable(False, False)
-        self.fields = FieldPanel(self.window, self.update_info)
-        self.fields.pack(fill='x')
         a = app.session.appearance
+        fit_window(self.window, 540*a.ui_scale_percent/100., 680*a.ui_scale_percent/100., min_width=480, min_height=540)
+        buttons = ttk.Frame(self.window, padding=8)
+        buttons.pack(side='bottom', fill='x')
+        controls = ScrollPanel(self.window)
+        controls.pack(fill='both', expand=True)
+        self.fields = FieldPanel(controls.body, self.update_info)
+        self.fields.pack(fill='x')
         add = self.fields.add
         self.language_choices = {'Как в программе': 'auto', 'Русский': 'ru', 'English': 'en'}
         self.layout_choices = ({'Весь спектр + область + интеграл': 'full', 'Область + интеграл': 'fit', 'Только область': 'region'}
@@ -2013,13 +2255,13 @@ class ImageExportWindow:
         add('export_region_names', 'Названия областей на рисунке', a.export_region_names, kind=bool)
         add('title', 'Заголовок (необязательно)', '', kind=str)
         self.info = TranslatedVar(self.window)
-        ttk.Label(self.window, textvariable=self.info, padding=8, wraplength=450).pack(fill='x')
-        ttk.Label(self.window, text='SVG — векторный формат; DPI влияет на PNG и TIFF.',
+        ttk.Label(controls.body, textvariable=self.info, padding=8, wraplength=450).pack(fill='x')
+        ttk.Label(controls.body, text='SVG — векторный формат; DPI влияет на PNG и TIFF.',
                   padding=8, wraplength=450).pack(fill='x')
-        buttons = ttk.Frame(self.window, padding=8)
-        buttons.pack(fill='x')
-        ttk.Button(buttons, text='Сохранить рисунок…', command=self.save).pack(side='left')
+        self.save_button = ttk.Button(buttons, text='Сохранить рисунок…', command=self.save, style='Accent.TButton')
+        self.save_button.pack(side='left')
         ttk.Button(buttons, text='Отмена', command=self.window.destroy).pack(side='right')
+        scale_explicit_fonts(self.window, a.ui_scale_percent)
         translate_widgets(self.window, app.language)
         self.update_info()
 
@@ -2073,9 +2315,7 @@ class PreprocessWindow:
         self.app = app
         self.window = tk.Toplevel(app.root)
         self.window.title('Аподизация и локальная базовая линия')
-        available_width, available_height = max(700, app.root.winfo_screenwidth()-80), max(500, app.root.winfo_screenheight()-100)
-        self.window.geometry(f'{min(1280, available_width)}x{min(820, available_height)}')
-        self.window.minsize(min(1000, available_width), min(650, available_height))
+        fit_window(self.window, 1600, 1000)
         self.timer = None
         self.revision = 0
         self.loading = True
@@ -2093,7 +2333,7 @@ class PreprocessWindow:
         split = ttk.Panedwindow(self.window, orient='horizontal')
         split.pack(fill='both', expand=True)
         controls, right = ScrollPanel(split), ttk.Frame(split)
-        controls.canvas.configure(width=420)
+        controls.canvas.configure(width=round(385*display_factor(app.root)))
         left = controls.body
         split.add(controls, weight=0)
         split.add(right, weight=1)
@@ -2126,9 +2366,8 @@ class PreprocessWindow:
                   'В JSON сохраняются только метод и параметры; базовая линия рассчитывается заново для каждого спектра. '
                   'Для остальных областей нажмите «Применить ко всем областям».',
                   wraplength=350, foreground='#65758a').pack(anchor='w', pady=8)
-        self.figure = Figure(figsize=(8, 7), dpi=100, facecolor='white')
+        self.figure = Figure(figsize=(8, 7), dpi=100, facecolor='white', layout='constrained')
         self.ax_apod, self.ax_base = self.figure.subplots(2, 1)
-        self.figure.subplots_adjust(left=.10, right=.98, top=.94, bottom=.08, hspace=.4)
         WheelControls(right, app, lambda: self.navigation.reset()).pack(fill='x')
         preview_controls = ttk.Frame(right, padding=4)
         preview_controls.pack(fill='x')
@@ -2140,12 +2379,13 @@ class PreprocessWindow:
         self.pick_anchors = tk.BooleanVar(value=False)
         ttk.Checkbutton(right, text='Выбирать опорные точки: левая кнопка добавляет, правая удаляет',
                         variable=self.pick_anchors, command=self.enable_anchors).pack(anchor='w', padx=5)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=right)
+        self.canvas = SpectrumCanvas(self.figure, master=right)
         self.toolbar = SpectrumToolbar(self.canvas, right)
         self.canvas.get_tk_widget().pack(fill='both', expand=True)
         self.canvas.mpl_connect('button_press_event', self.on_anchor_click)
         self.canvas.mpl_connect('button_press_event', app.pick_phase_pivot)
         self.canvas.mpl_connect('key_press_event', app.region_edit_key)
+        scale_explicit_fonts(self.window, app.session.appearance.ui_scale_percent)
         self.navigation = PlotNavigation(self.canvas, (self.ax_apod, self.ax_base),
             lambda: (self.cached_result[0].ppm[0], self.cached_result[0].ppm[-1]) if self.cached_result else None,
             app.wheel_mode_code, app.adjust_phase_wheel, lambda: app.phase_pivot_armed)
@@ -2320,6 +2560,7 @@ class PreprocessWindow:
             if ax.lines:
                 ax.legend(fontsize=8)
         self.app.draw_phase_pivot((self.ax_apod, self.ax_base), current)
+        style_live_figure(self.figure, self.app.session.appearance.ui_scale_percent)
         self.navigation.after_draw()
         self.canvas.draw_idle()
 
@@ -2402,6 +2643,7 @@ class PreprocessWindow:
 
 
 def main():
+    enable_windows_dpi()
     root = tk.Tk()
     SpintegrateApp(root)
     root.mainloop()

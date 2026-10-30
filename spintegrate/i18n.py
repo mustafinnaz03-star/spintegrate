@@ -6,6 +6,33 @@ from tkinter import ttk
 
 
 EN = {
+    'Масштаб UI': 'UI scale', 'Скрыть настройки': 'Hide settings', 'Показать настройки': 'Show settings',
+    'Развернуть окно': 'Maximize / restore',
+    'Масштаб интерфейса: 80, 90, 100, 110, 125 или 150%.': 'UI scale: 80, 90, 100, 110, 125 or 150%.',
+    'Лоренцы: ручной выбор пиков': 'Lorentzian fit: manual peaks',
+    'Допуск центра ±, ppm': 'Center tolerance ±, ppm',
+    'Для ручных пиков: допустимое остаточное смещение после выравнивания.':
+        'Manual peaks: allowed residual center shift after alignment.',
+    'Размечать пики': 'Mark peaks', 'Отменить пик': 'Undo peak edit', 'Очистить пики': 'Clear peaks',
+    'Включите «Размечать пики» для кликов; выключите для выбора областей мышью.':
+        'Enable Mark peaks for clicks; disable it to select region bounds by dragging.',
+    'Начальные ppm:': 'Initial ppm:', 'Применить пики': 'Apply peaks',
+    'Сначала выберите область обработки.': 'Select a processing region first.',
+    'Ручные пики: левая кнопка добавляет, правая удаляет ближайший. Ctrl+Z — отмена; Esc — закончить.':
+        'Manual peaks: left-click adds; right-click removes nearby. Ctrl+Z: undo; Esc: finish.',
+    'Отметьте пик внутри выбранной области обработки.': 'Mark a peak inside the selected processing region.',
+    'Для отмены выберите область последнего изменённого пика.': 'Select the last edited peak’s region to undo.',
+    'Введите ppm через точку с запятой; десятичный разделитель — точка.': 'Separate ppm values with semicolons; use a decimal point.',
+    'Отметьте пики в каждой области. Центры, амплитуды и ширины оптимизируются. В серии выравнивание обязательно. Интеграл = Σ A × HWHM по итоговым центрам.':
+        'Mark peaks in each region. Centers, amplitudes and widths are optimized. Batch alignment is required. Integral = Σ A × HWHM using fitted centers.',
+    'Ручная разметка (старт)': 'Manual marks (initial)', 'Оптимизированные центры': 'Optimized centers',
+    'Центр ручного пика достиг границы допуска; проверьте разметку и выравнивание.':
+        'A manual peak center reached its bound; inspect the marks and alignment.',
+    'Начальная высота ручного пика неположительна; проверьте фазу, базовую линию или разрешите отрицательные амплитуды.':
+        'A manual peak starts at a nonpositive height; inspect phase/baseline or allow negative amplitudes.',
+    'Допуск смещения ручных пиков должен быть положительным, в ppm.': 'Manual center tolerance must be positive, in ppm.',
+    ' №     ppm (оптим.)  A            HWHM ppm     A×HWHM': ' #     ppm (fitted)  A            HWHM ppm     A×HWHM',
+    ' №       ppm (оптим.)      A            HWHM ppm        A×HWHM': ' #       ppm (fitted)      A            HWHM ppm        A×HWHM',
     'Колесо мыши:': 'Mouse wheel:', 'Интенсивность': 'Intensity', 'Масштаб ppm': 'ppm zoom',
     'Фаза P0': 'Phase P0', 'Фаза P1': 'Phase P1', 'Сбросить вид': 'Reset view',
     'Опора фазы…': 'Set phase pivot…', 'Ручная поправка P0, °': 'Manual P0 offset, °',
@@ -288,6 +315,13 @@ EN = {
 
 # Capture already-formatted arguments without changing user-controlled names.
 TEMPLATES = {
+    '{name}: {n} пиков': '{name}: {n} peaks',
+    '{name}: сначала отметьте ручные пики.': '{name}: mark manual peaks first.',
+    '{name}: ручные пики должны быть уникальными и строго внутри области.': '{name}: manual peaks must be unique and strictly inside the region.',
+    '{name}: число ручных пиков превышает лимит {n}.': '{name}: manual peak count exceeds the limit {n}.',
+    'Начальные ppm: {values}': 'Initial ppm: {values}',
+    'Ручных пиков: {n}; допуск центра ±{ppm} ppm. Центры, амплитуды и ширины оптимизируются. Выравнивание в серии обязательно; интеграл = Σ A × HWHM.':
+        'Manual peaks: {n}; center tolerance ±{ppm} ppm. Centers, amplitudes and widths are optimized. Batch alignment is required; integral = Σ A × HWHM.',
     'Рецепт: {n} областей обработки, {m} интегралов.': 'Recipe: {n} processing regions, {m} integrals.',
     'Опора: {ppm} ppm': 'Pivot: {ppm} ppm',
     'Ручная фаза P0={p0}°, P1={p1}°; опора {ppm} ppm. Ctrl — точно; Shift — P1.':

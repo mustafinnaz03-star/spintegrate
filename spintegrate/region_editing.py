@@ -4,6 +4,7 @@ import math
 
 
 def shift_anchors(region, delta):
+    region.manual_peaks = [v+delta for v in region.manual_peaks]
     if region.baseline.method == 'interp_pts' and region.baseline.parameters.get('anchor_ppm'):
         region.baseline.parameters['anchor_ppm'] = [v+delta for v in region.baseline.parameters['anchor_ppm']]
 
@@ -43,6 +44,11 @@ def move_or_resize(session, kind, name, low, high, spectrum_limits):
             if anchors:
                 region.low = min(region.low, min(anchors))
                 region.high = max(region.high, max(anchors))
+        if kind == 'fit' and region.manual_peaks:
+            # Keep saved peak marks strictly inside resized processing bounds.
+            margin = max((maximum-minimum)*1e-10, 1e-12)
+            region.low = min(region.low, min(region.manual_peaks)-margin)
+            region.high = max(region.high, max(region.manual_peaks)+margin)
     if not minimum <= region.low < region.high <= maximum:
         raise ValueError('The region must fit inside its spectrum or parent region.')
     result.validate()

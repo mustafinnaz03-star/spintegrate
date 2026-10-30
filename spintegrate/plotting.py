@@ -30,6 +30,8 @@ def draw_spectrum(overview, detail, residual, spectrum, session, selected_region
     t = lambda text: tr(text, language)
     direct = (getattr(analysis, 'method', None) == 'direct'
               or getattr(session, 'analysis_method', 'lorentzian') == 'direct')
+    manual = (getattr(analysis, 'method', None) == 'lorentzian_manual'
+              or session.analysis_method == 'lorentzian_manual')
     lower_title = 'Накопленный интеграл по областям' if direct else 'Остаток: данные − подгонка'
     for ax, title in ((overview, 'Весь спектр'), (detail, 'Выбранная область'), (residual, lower_title)):
         ax.clear()
@@ -81,8 +83,13 @@ def draw_spectrum(overview, detail, residual, spectrum, session, selected_region
                             alpha=.9 if i+1 in flagged else .6)
                 if i+1 in flagged:
                     detail.annotate(f'L{i+1}', (result.centers[i], result.amplitudes[i]), fontsize=8)
-            detail.scatter(result.centers, result.initial_amplitudes, color='#c33b43',
-                           s=20, zorder=4, label=t('Peak-picking (фикс. центры)'))
+            initial_centers = result.diagnostics.get('initial_centers_ppm', result.centers)
+            detail.scatter(initial_centers, result.initial_amplitudes, color='#c33b43', marker='x' if manual else 'o',
+                           s=26 if manual else 20, zorder=4,
+                           label=t('Ручная разметка (старт)') if manual else t('Peak-picking (фикс. центры)'))
+            if manual:
+                detail.scatter(result.centers, result.amplitudes, facecolors='none', edgecolors='#8957a7',
+                               s=32, zorder=5, label=t('Оптимизированные центры'))
             residual.plot(x, y-result.fitted, color='#687689', lw=.85)
             title = (f'{result.region}: ' if show_region_names else '') + f'{len(result.centers)} пиков; '
             title += 'сошлось' if result.success else 'НЕ СОШЛОСЬ'
@@ -96,10 +103,12 @@ def draw_spectrum(overview, detail, residual, spectrum, session, selected_region
             direct_data = (x, y, line)
             detail.set_title(t('Прямое интегрирование'), fontsize=10, loc='left')
         else:
-            detail.scatter(*peaks, color='#c33b43', s=22, zorder=4, label='Peak-picking')
-            detail.axhline(session.fit.threshold, color='#c33b43', ls=':', lw=.8, label='Threshold')
-            if session.fit.signed:
-                detail.axhline(-session.fit.threshold, color='#c33b43', ls=':', lw=.8)
+            detail.scatter(*peaks, color='#c33b43', marker='x' if manual else 'o', s=26, zorder=4,
+                           label=t('Ручная разметка (старт)') if manual else 'Peak-picking')
+            if not manual:
+                detail.axhline(session.fit.threshold, color='#c33b43', ls=':', lw=.8, label='Threshold')
+                if session.fit.signed:
+                    detail.axhline(-session.fit.threshold, color='#c33b43', ls=':', lw=.8)
     elif region:
         mask = (spectrum.ppm >= region.low) & (spectrum.ppm <= region.high)
         detail.plot(spectrum.ppm[mask], spectrum.intensity[mask], color='#254b79', lw=.8, label=t('Спектр'))
@@ -111,6 +120,12 @@ def draw_spectrum(overview, detail, residual, spectrum, session, selected_region
     else:
         detail.plot(spectrum.ppm, spectrum.intensity, color='#254b79', lw=.8, label=t('Спектр'))
     if region:
+        if manual:
+            for i, center in enumerate(sorted(region.manual_peaks), 1):
+                detail.axvline(center, color='#c33b43', alpha=.35, lw=.7, ls=':')
+                if show_region_names:
+                    detail.text(center, .97, f'M{i}', transform=detail.get_xaxis_transform(),
+                                va='top', ha='center', color='#c33b43', fontsize=8)
         detail.set_xlim(region.high, region.low)
         if direct_data is not None:
             x, y, baseline = direct_data

@@ -46,6 +46,12 @@ def test_old_settings_and_fit_files_get_compatible_presentation_defaults(tmp_pat
     assert analysis.results and recipe.appearance.export_dpi == 300
 
 
+@pytest.mark.parametrize('value', [75, 101, 200, True, 125., float('nan')])
+def test_display_scale_rejects_unsupported_values(value):
+    with pytest.raises(ValueError, match='Масштаб интерфейса'):
+        validate_appearance(AppearanceSettings(ui_scale_percent=value))
+
+
 def test_language_color_and_export_preferences_survive_json_and_spfit(tmp_path, fitted):
     analysis, recipe = fitted
     recipe.integrals[0].color = '#CC79A7'
