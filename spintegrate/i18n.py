@@ -6,6 +6,29 @@ from tkinter import ttk
 
 
 EN = {
+    'Колесо мыши:': 'Mouse wheel:', 'Интенсивность': 'Intensity', 'Масштаб ppm': 'ppm zoom',
+    'Фаза P0': 'Phase P0', 'Фаза P1': 'Phase P1', 'Сбросить вид': 'Reset view',
+    'Опора фазы…': 'Set phase pivot…', 'Ручная поправка P0, °': 'Manual P0 offset, °',
+    'Ручная поправка P1, °': 'Manual P1 offset, °', 'Сбросить ручную фазу': 'Reset manual phase',
+    'Поправки добавляются к выбранной фазе до LB; колесо не запускает новую автофазировку.':
+        'Offsets are added to the selected phase before LB; the wheel does not rerun automatic phasing.',
+    'Ручная фазировка недоступна в режиме abs.': 'Manual phasing is unavailable in abs mode.',
+    'Для ручной фазировки pdata нужен файл 1i.': 'Manual pdata phasing requires the 1i file.',
+    'Щёлкните по спектру, чтобы выбрать опору фазы P1.': 'Click the spectrum to set the P1 phase pivot.',
+    'Ctrl+колесо: ppm; Shift+колесо: сдвиг; двойной щелчок: сброс.':
+        'Ctrl+wheel: ppm zoom; Shift+wheel: pan; double-click: reset view.',
+    'Выравнивание спектров': 'Spectrum alignment', 'Единый сдвиг спектра': 'Whole spectrum',
+    'По областям обработки': 'Each processing region', 'Макс. дрейф, ppm': 'Max. drift, ppm',
+    'Мин. корреляция': 'Min. correlation', 'Окно: от': 'Window: from', 'до': 'to',
+    'Выравнивание, ppm': 'Alignment, ppm',
+    'Корреляция': 'Correlation',
+    'Подробности рецепта': 'Recipe details',
+    'Нажмите «Запомнить → серия» или загрузите JSON настроек.': 'Click Use for batch or load a JSON recipe.',
+    'Исходная привязка ppm: метаданные каждого файла.': 'Initial ppm referencing: each file’s metadata.',
+    'Опора — первый спектр списка. Пустое окно — весь спектр; для локального режима используются области обработки.':
+        'Reference: first spectrum in the list. Blank window uses the full spectrum; regional mode uses processing regions.',
+    'Выравнивание: выключено.': 'Spectrum alignment: off.',
+    'Исходный контекст': 'Original context', 'Выровненные области': 'Aligned regions',
     'Двигать границы на графике': 'Edit saved regions on plot',
     'Отменить границы': 'Undo region bounds',
     'Выделение мышью заполняет границы новой области.': 'Drag to select bounds for a new region.',
@@ -265,6 +288,11 @@ EN = {
 
 # Capture already-formatted arguments without changing user-controlled names.
 TEMPLATES = {
+    'Рецепт: {n} областей обработки, {m} интегралов.': 'Recipe: {n} processing regions, {m} integrals.',
+    'Опора: {ppm} ppm': 'Pivot: {ppm} ppm',
+    'Ручная фаза P0={p0}°, P1={p1}°; опора {ppm} ppm. Ctrl — точно; Shift — P1.':
+        'Manual P0={p0}°, P1={p1}°; pivot {ppm} ppm. Ctrl: fine; Shift: P1.',
+    'Выравнивание к первому спектру: {mode}; максимум {ppm} ppm.': 'Alignment to first spectrum: {mode}; maximum {ppm} ppm.',
     'Привязка серии: референс {ppm} ppm; режим {mode}.': 'Batch referencing: reference {ppm} ppm; mode {mode}.',
     'Окно поиска референса: {low}…{high} ppm.': 'Reference search window: {low}…{high} ppm.',
     'Фаза P0={p0}°, P1={p1}°. Сохраняется при изменении LB.':
@@ -414,6 +442,10 @@ def translate_widgets(widget, language):
         if not hasattr(widget, '_source_title'):
             widget._source_title = widget.title()
         widget.title(tr(widget._source_title, language))
+    if isinstance(widget, ttk.LabelFrame):
+        if not hasattr(widget, '_source_label'):
+            widget._source_label = str(widget.cget('text'))
+        widget.configure(text=tr(widget._source_label, language))
     if isinstance(widget, (ttk.Label, ttk.Button, ttk.Checkbutton, ttk.Radiobutton)):
         if not str(widget.cget('textvariable')):
             if not hasattr(widget, '_source_label'):

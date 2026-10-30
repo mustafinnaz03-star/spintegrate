@@ -106,10 +106,10 @@ def pdata_uses_positive_transform(source):
 
 def process_pdata(source, p, phase_cache=None):
     from .core import (Spectrum, process_frequency_data, resolve_phase_angles,
-                       reference_axis, spectrum_from_fourier)
+                       reference_axis, spectrum_from_fourier, has_manual_phase, add_manual_phase)
     metadata = dict(source.processing_metadata)
     has_imag = bool(metadata.get('has_imaginary', metadata.get('has_imag', False)))
-    extra_transform = p.lb_hz > 0 or p.zero_fill_factor != 1 or p.phase != 'none'
+    extra_transform = p.lb_hz > 0 or p.zero_fill_factor != 1 or p.phase != 'none' or has_manual_phase(p)
     if extra_transform:
         if not has_imag:
             raise ValueError('Для дополнительной аподизации, фазировки, abs или zero filling pdata нужен файл 1i. '
@@ -124,6 +124,7 @@ def process_pdata(source, p, phase_cache=None):
         carrier = source.ppm[0] - bins[0]/source.sf_mhz
         phases, notes = resolve_phase_angles(source, p, phase_cache,
                                              reference=source.complex_spectrum)
+        phases = add_manual_phase(phases, p)
         positive = pdata_uses_positive_transform(source)
         ft = process_frequency_data(source.complex_spectrum, p, source.sw_hz, phases,
                                     positive=positive)
@@ -133,7 +134,7 @@ def process_pdata(source, p, phase_cache=None):
         result.processing_metadata = {**metadata, **result.processing_metadata}
         result.processing_metadata['additional_phases'] = list(result.phases)
         result.processing_metadata['additional_fft_convention'] = 'positive' if positive else 'negative'
-        if p.phase == 'none':
+        if p.phase == 'none' and not has_manual_phase(p):
             result.phases = source.phases
         result.notes.append('Дополнительная обработка применена к спектру после TopSpin; исходная фазировка не повторяется.')
         return result

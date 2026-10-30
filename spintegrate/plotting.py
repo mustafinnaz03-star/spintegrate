@@ -43,7 +43,14 @@ def draw_spectrum(overview, detail, residual, spectrum, session, selected_region
         overview.set_ylabel('')
     if spectrum is None:
         return
-    overview.plot(spectrum.ppm, spectrum.intensity, color='#254b79', lw=.8)
+    regional = spectrum.processing_metadata.get('alignment_mode') == 'regions' and analysis is not None
+    overview.plot(spectrum.ppm, spectrum.intensity, color='#a8b4c1' if regional else '#254b79', lw=.8,
+                  label=t('Исходный контекст') if regional else None)
+    if regional:
+        for index, result in enumerate(analysis.results.values()):
+            overview.plot(result.x, result.raw, color='#254b79', lw=.9,
+                          label=t('Выровненные области') if index == 0 else None)
+        overview.legend(fontsize=8, loc='upper right')
     overview.set_xlim(spectrum.ppm[-1], spectrum.ppm[0])
     for r in session.regions:
         overview.axvspan(r.low, r.high, color='#4d8bbb', alpha=.17)

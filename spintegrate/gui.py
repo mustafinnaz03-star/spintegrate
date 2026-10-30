@@ -30,6 +30,8 @@ from .i18n import TranslatedVar, canonical, set_label, tr, translate_widgets, wi
 from .region_names import next_region_name
 from .baseline_ui import BaselineControls
 from .region_editing import RegionHistory, move_or_resize
+from .alignment import AlignmentSettings, align_regions, align_spectrum
+from .navigation import PlotNavigation
 
 
 PHASE_LABELS = {'Без коррекции': 'none', 'ACME (nmrglue)': 'acme',
@@ -37,6 +39,121 @@ PHASE_LABELS = {'Без коррекции': 'none', 'ACME (nmrglue)': 'acme',
 REF_LABELS = {'Из метаданных Bruker': 'metadata', 'Самый сильный пик': 'strongest',
               'Пик в заданном ppm-окне': 'window'}
 ANALYSIS_LABELS = {'Деконволюция Лоренцами': 'lorentzian', 'Прямое интегрирование областей': 'direct'}
+WHEEL_MODES = {'Интенсивность': 'intensity', 'Масштаб ppm': 'ppm', 'Фаза P0': 'phase_p0', 'Фаза P1': 'phase_p1'}
+ALIGNMENT_MODES = {'Единый сдвиг спектра': 'global', 'По областям обработки': 'regions'}
+
+
+class SpectrumToolbar(NavigationToolbar2Tk):
+    def home(self, *args):
+        navigation = getattr(self.canvas, 'spectrum_navigation', None)
+        if navigation is not None:
+            navigation.reset()
+        else:
+            super().home(*args)
+
+
+class WheelControls(ttk.Frame):
+    def __init__(self, parent, app, reset):
+        super().__init__(parent, padding=3)
+        self.app = app
+        toolbar = ttk.Frame(self)
+        toolbar.pack(fill='x')
+        ttk.Label(toolbar, text='Колесо мыши:').pack(side='left', padx=3)
+        self.combo = ttk.Combobox(toolbar, textvariable=app.wheel_mode, state='readonly', width=16)
+        self.combo.pack(side='left')
+        ttk.Button(toolbar, text='Сбросить вид', command=reset).pack(side='left', padx=4)
+        ttk.Button(toolbar, text='Опора фазы…', command=app.arm_phase_pivot).pack(side='left', padx=4)
+        self.pivot_label = ttk.Label(self, text='Ctrl+колесо: ppm; Shift+колесо: сдвиг; двойной щелчок: сброс.', wraplength=650)
+        self.pivot_label.pack(fill='x', padx=3)
+        self.pivot_label.bind('<Configure>', lambda event: self.pivot_label.configure(wraplength=max(150, event.width-10)))
+        app.wheel_controls.append(self)
+        self.translate_choices(app.language)
+
+    def translate_choices(self, language):
+        value = canonical(self.app.wheel_mode.get())
+        self.combo.configure(values=[tr(label, language) for label in WHEEL_MODES])
+        self.app.wheel_mode.set(tr(value, language))
+
+
+class AlignmentControls(ttk.LabelFrame):
+    def __init__(self, parent, app):
+        super().__init__(parent, text='Выравнивание спектров', padding=6)
+        self.app, self.loading = app, True
+        self.vars = dict(enabled=tk.BooleanVar(value=False), mode=tk.StringVar(),
+                        max_shift_ppm=tk.StringVar(), min_correlation=tk.StringVar(),
+                        low_ppm=tk.StringVar(), high_ppm=tk.StringVar())
+        self.enabled_check = ttk.Checkbutton(self, text='Выравнивание спектров', variable=self.vars['enabled'])
+        self.enabled_check.grid(row=0, column=0, sticky='w')
+        self.combo = ttk.Combobox(self, textvariable=self.vars['mode'], state='readonly', width=25)
+        self.combo.grid(row=0, column=1, columnspan=2, padx=6)
+        self.entries = {}
+        for name, label, row, column in [('max_shift_ppm', 'Макс. дрейф, ppm', 0, 3),
+                ('min_correlation', 'Мин. корреляция', 0, 5), ('low_ppm', 'Окно: от', 1, 0), ('high_ppm', 'до', 1, 2)]:
+            ttk.Label(self, text=label).grid(row=row, column=column, sticky='w', padx=4, pady=3)
+            entry = ttk.Entry(self, textvariable=self.vars[name], width=10)
+            entry.grid(row=row, column=column+1, sticky='w', padx=4)
+            self.entries[name] = entry
+        ttk.Label(self, text='Опора — первый спектр списка. Пустое окно — весь спектр; '
+                  'для локального режима используются области обработки.',
+                  wraplength=630, foreground='#65758a').grid(row=1, column=4, columnspan=3, sticky='w', padx=5)
+        for variable in self.vars.values():
+            variable.trace_add('write', lambda *_: self.changed())
+        self.set_values(app.session.alignment)
+        self.loading = False
+
+    def translate_choices(self, language):
+        loading, self.loading = self.loading, True
+        self.combo.configure(values=[tr(label, language) for label in ALIGNMENT_MODES])
+        self.vars['mode'].set(tr(canonical(self.vars['mode'].get()), language))
+        self.loading = loading
+
+    def set_values(self, settings):
+        loading, self.loading = self.loading, True
+        for key, variable in self.vars.items():
+            value = next(label for label, code in ALIGNMENT_MODES.items() if code == settings.mode) if key == 'mode' else getattr(settings, key)
+            variable.set(self.app.t(value) if key == 'mode' else ('' if value is None else value))
+        self.translate_choices(self.app.language)
+        self.loading = loading
+        self.refresh_states()
+
+    def refresh_states(self):
+        self.enabled_check.configure(state='disabled' if self.app.batch_running else 'normal')
+        enabled = self.vars['enabled'].get() and not self.app.batch_running
+        self.combo.configure(state='readonly' if enabled else 'disabled')
+        for key, entry in self.entries.items():
+            active = enabled and (key not in ('low_ppm', 'high_ppm') or ALIGNMENT_MODES[canonical(self.vars['mode'].get())] == 'global')
+            entry.configure(state='normal' if active else 'disabled')
+
+    def read(self, default):
+        if not self.vars['enabled'].get():
+            result = copy.deepcopy(default)
+            result.enabled = False
+            return result
+        values = dict(enabled=True, mode=ALIGNMENT_MODES[canonical(self.vars['mode'].get())])
+        for key in ('max_shift_ppm', 'min_correlation', 'low_ppm', 'high_ppm'):
+            if key in ('low_ppm', 'high_ppm') and values['mode'] == 'regions':
+                values[key] = None
+                continue
+            text = self.vars[key].get().strip()
+            values[key] = None if key in ('low_ppm', 'high_ppm') and not text else float(text)
+        if values['mode'] == 'regions':
+            values.update(low_ppm=None, high_ppm=None)
+        settings = AlignmentSettings(**values)
+        settings.validate()
+        return settings
+
+    def changed(self):
+        if self.loading or self.app.loading_settings:
+            return
+        self.refresh_states()
+        try:
+            settings = self.read(self.app.session.alignment)
+            self.app.session.alignment = settings
+            if self.app.batch_recipe is not None:
+                self.app.batch_recipe.alignment = copy.deepcopy(settings)
+                self.app._recipe_description()
+        except ValueError as exc:
+            self.app.status.set(str(exc))
 
 
 class FieldPanel(ttk.Frame):
@@ -199,9 +316,13 @@ class SpintegrateApp:
         self._region_event_timers = set()
         self.region_history = RegionHistory()
         self.region_dragging = False
+        self.wheel_mode = tk.StringVar(root, value='Интенсивность')
+        self.wheel_controls = []
+        self.phase_pivot_armed = False
         self.preprocess_window = None
         self.status = TranslatedVar(root, value='Откройте папку эксперимента Bruker или демонстрационный спектр.')
         self._build()
+        self.wheel_mode.trace_add('write', lambda *_: self.wheel_mode_changed())
         self._sync_widgets()
         self.set_language(self.language)
         self.poll_timer = root.after(80, self._poll)
@@ -266,6 +387,9 @@ class SpintegrateApp:
         add('p0', 'Начальная фаза P0, °', p.p0)
         add('p1', 'Начальная фаза P1, °', p.p1)
         add('phase_peak_width', 'Окно peak_minima, точки', p.phase_peak_width, kind=int)
+        add('manual_phase_p0', 'Ручная поправка P0, °', p.manual_phase_p0,
+            hint='Поправки добавляются к выбранной фазе до LB; колесо не запускает новую автофазировку.')
+        add('manual_phase_p1', 'Ручная поправка P1, °', p.manual_phase_p1)
         add('reference_label', 'Привязка ppm', 'Из метаданных Bruker', list(REF_LABELS), str)
         add('reference_ppm', 'Референс, ppm', p.reference_ppm)
         add('reference_low', 'Окно референса: от', p.reference_low)
@@ -285,6 +409,7 @@ class SpintegrateApp:
                   wraplength=365, foreground='#65758a').pack(padx=8, pady=5, anchor='w')
         self.rephase_button = ttk.Button(processing_tab, text='Повторить автофазировку', command=self.rephase_spectrum)
         self.rephase_button.pack(fill='x', padx=8, pady=5)
+        ttk.Button(processing_tab, text='Сбросить ручную фазу', command=self.reset_manual_phase).pack(fill='x', padx=8, pady=3)
         self.phase_summary = ttk.Label(processing_tab, text='Фаза ещё не определена.', wraplength=365)
         self.phase_summary.pack(fill='x', padx=8, pady=3)
         explanation = ('P0/P1 — старт автоматического фазирования. «Без коррекции» показывает реальную часть FFT.\n'
@@ -341,16 +466,21 @@ class SpintegrateApp:
         self.detail_ax = self.figure.add_subplot(grid[1])
         self.residual_ax = self.figure.add_subplot(grid[2], sharex=self.detail_ax)
         self.figure.subplots_adjust(left=.09, right=.98, top=.95, bottom=.08)
+        WheelControls(right, self, lambda: self.navigation.reset()).pack(fill='x')
         self.canvas = FigureCanvasTkAgg(self.figure, master=right)
-        self.toolbar = NavigationToolbar2Tk(self.canvas, right)
+        self.toolbar = SpectrumToolbar(self.canvas, right)
         self.toolbar.update()
         self.canvas.mpl_connect('key_press_event', self.region_edit_key)
+        self.canvas.mpl_connect('button_press_event', self.pick_phase_pivot)
         self.selectors = []
         self.selection_label = ttk.Label(right, text='Во вкладке «Области» выберите режим, '
                                         'затем выделите диапазон мышью на графике.')
         self.selection_label.pack(side='bottom', fill='x', padx=8, pady=4)
         self.selection_label.bind('<Configure>', lambda event: self.selection_label.configure(wraplength=max(150, event.width-20)))
         self.canvas.get_tk_widget().pack(fill='both', expand=True)
+        self.navigation = PlotNavigation(self.canvas, (self.overview_ax, self.detail_ax, self.residual_ax),
+            self.spectrum_bounds, self.wheel_mode_code, self.adjust_phase_wheel,
+            lambda: self.region_dragging or self.phase_pivot_armed)
         self._draw_empty()
         self._build_batch()
         ttk.Label(self.root, textvariable=self.status, padding=(12, 8),
@@ -427,9 +557,15 @@ class SpintegrateApp:
         frame.pack(fill='both', expand=True)
         ttk.Label(frame, text='Повторение анализа с сохранёнными параметрами',
                   font=('Segoe UI', 15, 'bold')).pack(anchor='w')
+        self.recipe_summary_controls = ttk.Frame(frame)
+        self.recipe_summary_controls.pack(fill='x', pady=5)
+        self.recipe_summary = ttk.Label(self.recipe_summary_controls,
+            text='Нажмите «Запомнить → серия» или загрузите JSON настроек.')
+        self.recipe_summary.pack(side='left')
+        self.recipe_details_open = False
+        ttk.Button(self.recipe_summary_controls, text='Подробности рецепта', command=self.toggle_recipe_details).pack(side='left', padx=10)
         self.recipe_label = ttk.Label(frame, text='Нажмите «Запомнить → серия» во вкладке одного спектра '
                                      'или загрузите JSON.', wraplength=1200)
-        self.recipe_label.pack(anchor='w', pady=10)
         self.batch_root = tk.StringVar()
         self.batch_output = tk.StringVar(value=str(Path.cwd() / 'integrals.csv'))
         self.batch_recursive = tk.BooleanVar(value=True)
@@ -444,6 +580,8 @@ class SpintegrateApp:
         ttk.Button(paths, text='Выбрать…', command=self.choose_batch_output).grid(row=1, column=2, padx=6)
         ttk.Checkbutton(frame, text='Искать эксперименты во вложенных папках',
                         variable=self.batch_recursive).pack(anchor='w')
+        self.alignment_controls = AlignmentControls(frame, self)
+        self.alignment_controls.pack(fill='x', pady=6)
         buttons = ttk.Frame(frame)
         buttons.pack(fill='x', pady=12)
         ttk.Button(buttons, text='Показать найденные спектры', command=self.show_batch_paths).pack(side='left', padx=4)
@@ -461,7 +599,6 @@ class SpintegrateApp:
         ttk.Button(review_buttons, text='Открыть результаты CSV…', command=self.open_batch_results).pack(side='left', padx=4)
         ttk.Button(review_buttons, text='Открыть файл подгонки .spfit…', command=self.open_fit_file).pack(side='left', padx=4)
         table = ttk.Frame(frame)
-        table.pack(fill='both', expand=True, pady=8)
         table.rowconfigure(0, weight=1)
         table.columnconfigure(0, weight=1)
         self.batch_tree = ttk.Treeview(table, show='headings', height=11)
@@ -475,7 +612,8 @@ class SpintegrateApp:
         self.batch_tree.bind('<<TreeviewSelect>>', self.show_batch_row)
         self.batch_tree.bind('<Double-1>', lambda _: self.review_selected_fit())
         block, self.batch_text = scrolled_text(frame, 5)
-        block.pack(fill='x')
+        block.pack(side='bottom', fill='x')
+        table.pack(fill='both', expand=True, pady=8)
         set_text(self.batch_text, 'Каждый спектр обрабатывается независимо. Ошибки не останавливают '
                  'серию; недостоверные интегралы записываются как NaN. '
                  'CSV: номер спектра и отдельные числовые колонки областей. '
@@ -485,6 +623,7 @@ class SpintegrateApp:
     def _sync_widgets(self):
         self.region_history.clear()
         self.region_dragging = False
+        self.phase_pivot_armed = False
         self.loading_settings = True
         p = asdict(self.session.processing)
         p['phase_label'] = next(k for k, v in PHASE_LABELS.items() if v == p['phase'])
@@ -493,6 +632,7 @@ class SpintegrateApp:
         self.fit_fields.set_values(asdict(self.session.fit))
         self.fit_fields.set_values({'analysis_label': next(k for k, v in ANALYSIS_LABELS.items()
                                                          if v == self.session.analysis_method)})
+        self.alignment_controls.set_values(self.session.alignment)
         self.update_analysis_controls()
         self.loading_settings = False
         self.refresh_regions()
@@ -553,6 +693,7 @@ class SpintegrateApp:
         if self.preprocess_window and self.preprocess_window.window.winfo_exists():
             self.preprocess_window.store_controls()
         s = copy.deepcopy(self.session)
+        s.alignment = self.alignment_controls.read(s.alignment)
         p = self.processing_fields.values()
         p['phase'] = PHASE_LABELS[canonical(p.pop('phase_label'))]
         p['reference_mode'] = REF_LABELS[canonical(p.pop('reference_label'))]
@@ -587,6 +728,107 @@ class SpintegrateApp:
     def update_phase_controls(self):
         phase = PHASE_LABELS[canonical(self.processing_fields.vars['phase_label'].get())]
         self.rephase_button.configure(state='normal' if phase in ('acme', 'peak_minima') else 'disabled')
+        for key in ('manual_phase_p0', 'manual_phase_p1'):
+            self.processing_fields.enable(key, phase != 'abs')
+
+    def wheel_mode_code(self):
+        return WHEEL_MODES.get(canonical(self.wheel_mode.get()), 'intensity')
+
+    def wheel_mode_changed(self):
+        if not self.loading_settings:
+            self.draw(local=self.preview_local)
+
+    def spectrum_bounds(self):
+        return (self.spectrum.ppm[0], self.spectrum.ppm[-1]) if self.spectrum is not None else None
+
+    def navigation_context(self):
+        p = self.session.processing
+        region = next((r for r in self.session.regions if r.name == self.selected_region), None)
+        return (id(self.raw), self.selected_region, (region.low, region.high) if region else None,
+                self.session.analysis_method, p.reference_mode, p.reference_ppm, p.ppm_offset,
+                p.reference_low, p.reference_high)
+
+    def adjust_phase_wheel(self, mode, notches):
+        if self.raw is None:
+            return
+        phase = PHASE_LABELS[canonical(self.processing_fields.vars['phase_label'].get())]
+        if phase == 'abs':
+            self.status.set('Ручная фазировка недоступна в режиме abs.')
+            return
+        if self.source_mode == 'pdata' and not self.raw.processing_metadata.get('has_imaginary', self.raw.processing_metadata.get('has_imag', False)):
+            self.status.set('Для ручной фазировки pdata нужен файл 1i.')
+            return
+        key = 'manual_phase_p1' if mode == 'phase_p1' else 'manual_phase_p0'
+        try:
+            value = float(self.processing_fields.vars[key].get())
+            value += notches*(5. if mode == 'phase_p1' else 1.)
+            self.processing_fields.vars[key].set(f'{value:.6g}')
+        except ValueError as exc:
+            self.status.set(str(exc))
+
+    def reset_manual_phase(self):
+        self.loading_settings = True
+        self.processing_fields.set_values(dict(manual_phase_p0=0., manual_phase_p1=0.))
+        self.session.processing.phase_pivot_fraction = .5
+        self.loading_settings = False
+        self.phase_pivot_armed = False
+        self.settings_changed()
+
+    def arm_phase_pivot(self):
+        if self.raw is None:
+            return self.error('Сначала загрузите спектр.')
+        if PHASE_LABELS[canonical(self.processing_fields.vars['phase_label'].get())] == 'abs':
+            self.status.set('Ручная фазировка недоступна в режиме abs.')
+            return
+        if self.source_mode == 'pdata' and not self.raw.processing_metadata.get('has_imaginary', self.raw.processing_metadata.get('has_imag', False)):
+            self.status.set('Для ручной фазировки pdata нужен файл 1i.')
+            return
+        self.wheel_mode.set(self.t('Фаза P1'))
+        self.phase_pivot_armed = True
+        for selector in self.selectors:
+            selector.set_active(False)
+        self.status.set('Щёлкните по спектру, чтобы выбрать опору фазы P1.')
+
+    def pick_phase_pivot(self, event):
+        if not self.phase_pivot_armed or event.button != 1 or event.xdata is None:
+            return
+        spectrum = self.spectrum
+        popup = self.preprocess_window
+        if popup and event.canvas is popup.canvas and popup.cached_result:
+            spectrum = popup.cached_result[0]
+        if spectrum is None:
+            return
+        try:
+            p = self.read_settings().processing
+            fraction = float(np.clip((event.xdata-spectrum.ppm[0])/(spectrum.sw_hz/spectrum.sf_mhz), 0., 1.))
+            self.loading_settings = True
+            # Changing the pivot alone leaves the current phase curve unchanged.
+            p0 = p.manual_phase_p0+p.manual_phase_p1*(fraction-p.phase_pivot_fraction)
+            self.processing_fields.vars['manual_phase_p0'].set(f'{p0:.12g}')
+            self.session.processing.phase_pivot_fraction = fraction
+        except ValueError as exc:
+            self.status.set(str(exc))
+            return
+        finally:
+            self.loading_settings = False
+            self.phase_pivot_armed = False
+        self.settings_changed()
+
+    def draw_phase_pivot(self, axes, spectrum):
+        if spectrum is None:
+            return
+        pivot = spectrum.ppm[0]+self.session.processing.phase_pivot_fraction*spectrum.sw_hz/spectrum.sf_mhz
+        p = self.session.processing
+        message = (f'Ручная фаза P0={p.manual_phase_p0:.3f}°, P1={p.manual_phase_p1:.3f}°; опора {pivot:.4f} ppm. Ctrl — точно; Shift — P1.'
+                   if self.wheel_mode_code().startswith('phase_') else
+                   'Ctrl+колесо: ppm; Shift+колесо: сдвиг; двойной щелчок: сброс.')
+        for controls in self.wheel_controls:
+            if controls.winfo_exists():
+                set_label(controls.pivot_label, message)
+        if self.wheel_mode_code().startswith('phase_'):
+            for axis in axes:
+                if min(axis.get_xlim()) <= pivot <= max(axis.get_xlim()):
+                    axis.axvline(pivot, color='#8957a7', ls=':', lw=1.)
 
     def rephase_spectrum(self):
         phase = PHASE_LABELS[canonical(self.processing_fields.vars['phase_label'].get())]
@@ -868,6 +1110,7 @@ class SpintegrateApp:
     def draw(self, local=None):
         if self.region_dragging:
             return
+        self.navigation.before_draw(self.navigation_context())
         # Clear selectors before axes; retain references for interactive dragging.
         for selector in self.selectors:
             selector.disconnect_events()
@@ -885,8 +1128,15 @@ class SpintegrateApp:
                 set_label(self.selection_label, 'Выберите сохранённую область в таблице. Потяните край для изменения размера '
                           'или середину для перемещения. Ctrl+Z отменяет изменение; Esc отменяет перетаскивание.')
                 if editable is None:
+                    self.draw_phase_pivot((self.overview_ax, self.detail_ax), self.spectrum)
+                    self.navigation.after_draw()
                     self.canvas.draw_idle()
                     return
+            if self.edit_regions.get() and kind == 'fit' and editable:
+                margin = .12*(editable.high-editable.low)
+                self.detail_ax.set_xlim(editable.high+margin, editable.low-margin)
+            self.draw_phase_pivot((self.overview_ax, self.detail_ax), self.spectrum)
+            self.navigation.after_draw()
             for ax in (self.overview_ax, self.detail_ax):
                 editing = self.edit_regions.get() and editable is not None
                 callback = (lambda low, high, k=kind, n=editable.name: self.edit_saved_bounds(k, n, low, high)) if editing else self.on_span
@@ -898,9 +1148,6 @@ class SpintegrateApp:
                     onmove_callback=self.preview_region_bounds if editing else None, minspan=1e-10)
                 if editing:
                     selector.extents = (editable.low, editable.high)
-                    if ax == self.detail_ax and kind == 'fit':
-                        margin = .12*(editable.high-editable.low)
-                        ax.set_xlim(editable.high+margin, editable.low-margin)
                 self.selectors.append(selector)
         self.canvas.draw_idle()
 
@@ -988,6 +1235,10 @@ class SpintegrateApp:
             self.status.set(str(exc))
 
     def region_edit_key(self, event):
+        if event.key == 'escape' and self.phase_pivot_armed:
+            self.phase_pivot_armed = False
+            self.draw(local=self.preview_local)
+            return
         if event.key == 'escape' and self.region_dragging:
             self.region_dragging = False
             self.restore_region_bound_fields()
@@ -1300,6 +1551,7 @@ class SpintegrateApp:
 
     def _recipe_description(self):
         s = self.batch_recipe
+        set_label(self.recipe_summary, f'Рецепт: {len(s.regions)} областей обработки, {len(s.integrals)} интегралов.')
         intro = f'Источник спектра: {s.processing.source_mode}\nРежим анализа: '
         intro += next(k for k, v in ANALYSIS_LABELS.items() if v == s.analysis_method) + '\n'
         if s.processing.source_mode == 'pdata':
@@ -1310,12 +1562,22 @@ class SpintegrateApp:
                  'Центры и амплитуды определяются заново в каждом спектре.' if s.analysis_method == 'lorentzian' else
                  f'Сохранено областей интегрирования: {len(s.integrals)}. Численный интеграл: интенсивность × ppm.')
         p = s.processing
-        reference = ('Привязка серии: шкала каждого файла, без автоматического выравнивания.'
+        reference = (('Исходная привязка ppm: метаданные каждого файла.' if s.alignment.enabled else
+                      'Привязка серии: шкала каждого файла, без автоматического выравнивания.')
                      if p.reference_mode == 'metadata' else
                      f'Привязка серии: референс {p.reference_ppm:g} ppm; режим {p.reference_mode}.')
         if p.reference_mode == 'window':
             reference += f'\nОкно поиска референса: {p.reference_low:g}…{p.reference_high:g} ppm.'
-        set_label(self.recipe_label, intro + text + '\n' + reference)
+        alignment = ('Выравнивание: выключено.' if not s.alignment.enabled else
+                     f'Выравнивание к первому спектру: {s.alignment.mode}; максимум {s.alignment.max_shift_ppm:g} ppm.')
+        set_label(self.recipe_label, intro + text + '\n' + reference + '\n' + alignment)
+
+    def toggle_recipe_details(self):
+        self.recipe_details_open = not self.recipe_details_open
+        if self.recipe_details_open:
+            self.recipe_label.pack(after=self.recipe_summary_controls, anchor='w', pady=5)
+        else:
+            self.recipe_label.pack_forget()
 
     def export_single(self):
         if self.analysis is None:
@@ -1414,6 +1676,7 @@ class SpintegrateApp:
             return self.error('Сначала «Запомнить → серия» или загрузить JSON настроек.')
         try:
             recipe = copy.deepcopy(self.batch_recipe)
+            recipe.alignment = self.alignment_controls.read(recipe.alignment)
             recipe.validate(require_regions=True)
             root = self.batch_root.get()
             paths = discover_spectra(root, self.batch_recursive.get(), recipe.processing.source_mode,
@@ -1432,6 +1695,7 @@ class SpintegrateApp:
         except Exception as exc:
             return self.error(str(exc))
         self.batch_running = True
+        self.alignment_controls.refresh_states()
         self.batch_cancel.clear()
         self.batch_rows.clear()
         self.batch_results_recipe = copy.deepcopy(recipe)
@@ -1457,6 +1721,7 @@ class SpintegrateApp:
 
     def _batch_unlock(self):
         self.batch_running = False
+        self.alignment_controls.refresh_states()
         self.batch_button.configure(state='normal')
         self.cancel_button.configure(state='disabled')
 
@@ -1470,12 +1735,17 @@ class SpintegrateApp:
                          f"Файл подгонки: {row.get('fit_file') or 'не сохранён'}")
 
     def configure_batch_columns(self, recipe):
-        columns = ['number', 'id', 'status'] + [f'area{i}' for i in range(len(recipe.integrals))]
+        columns = ['number', 'id', 'status'] + (['alignment', 'alignment_score'] if recipe.alignment.enabled else []) + [f'area{i}' for i in range(len(recipe.integrals))]
         self.batch_tree.configure(columns=columns)
         for key, label, width in [('number', 'Номер спектра', 110), ('id', 'ID спектра', 200),
                                   ('status', 'Статус', 95)]:
             self.batch_tree.heading(key, text=label)
             self.batch_tree.column(key, width=width, minwidth=75, stretch=False)
+        if recipe.alignment.enabled:
+            self.batch_tree.heading('alignment', text='Выравнивание, ppm')
+            self.batch_tree.column('alignment', width=155, minwidth=100)
+            self.batch_tree.heading('alignment_score', text='Корреляция')
+            self.batch_tree.column('alignment_score', width=95, minwidth=80)
         for i, area in enumerate(recipe.integrals):
             self.batch_tree.heading(f'area{i}', text=area.name)
             self.batch_tree.column(f'area{i}', width=155, minwidth=100)
@@ -1484,6 +1754,12 @@ class SpintegrateApp:
     def insert_batch_row(self, row):
         recipe = self.batch_results_recipe
         values = [row['spectrum_number'], row['spectrum_id'], row['status']]
+        if recipe.alignment.enabled:
+            value = row.get('alignment_shift_ppm') if recipe.alignment.mode == 'global' else row.get('alignment_max_abs_shift_ppm')
+            values.append((f'{value:+.6g}' if recipe.alignment.mode == 'global' else f'max |Δ| {value:.6g}')
+                          if isinstance(value, (float, int)) else '')
+            score = row.get('alignment_correlation')
+            values.append(f'{score:.3f}' if isinstance(score, (float, int)) else '')
         values.extend(f"{row[f'integral__{r.name}']:.9g}" for r in recipe.integrals)
         self.batch_tree.insert('', 'end', values=values)
 
@@ -1538,9 +1814,23 @@ class SpintegrateApp:
             return self.error('Файл .spfit не найден и исходный спектр недоступен. '
                               'Откройте сохранённый .spfit или верните исходный FID для старой серии.')
         self.status.set('Для этой серии нет сохранённого фита. Повторный расчёт по её сохранённым настройкам…')
+        reference_id = row.get('alignment_reference')
+        reference_row = next((entry for entry in self.batch_rows if entry['spectrum_id'] == reference_id), None)
+        reference_source = reference_row.get('source_path') if reference_row else None
         def work():
             raw = load_source(source, recipe.processing)
-            return analyze(process(raw, recipe.processing), recipe)
+            spectrum = process(raw, recipe.processing)
+            if recipe.alignment.enabled:
+                if not reference_source or not Path(reference_source).exists():
+                    raise ValueError('The first reference spectrum is required to reconstruct an aligned result.')
+                reference = process(load_source(reference_source, recipe.processing), recipe.processing)
+                first = Path(source).resolve() == Path(reference_source).resolve()
+                if recipe.alignment.mode == 'global':
+                    spectrum, _ = align_spectrum(reference, spectrum, recipe.alignment, reference_id, first)
+                else:
+                    spectrum, views, errors, _ = align_regions(reference, spectrum, recipe, reference_id, first)
+                    return analyze(spectrum, recipe, views, errors)
+            return analyze(spectrum, recipe)
         def ready(analysis):
             self._show_fit_review(analysis, recipe, 'ПОВТОРНЫЙ РАСЧЁТ из исходного спектра: ' + source)
         self.submit('review', work, ready)
@@ -1632,9 +1922,11 @@ class FitReviewWindow:
         plot_frame = ttk.Frame(self.window)
         plot_frame.pack(fill='both', expand=True)
         self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
+        self.toolbar = SpectrumToolbar(self.canvas, plot_frame)
         self.canvas.get_tk_widget().pack(fill='both', expand=True)
-        self.toolbar = NavigationToolbar2Tk(self.canvas, plot_frame)
         self.toolbar.update()
+        self.navigation = PlotNavigation(self.canvas, (self.overview_ax, self.detail_ax, self.residual_ax),
+            lambda: (self.analysis.spectrum.ppm[0], self.analysis.spectrum.ppm[-1]))
         block, self.details = scrolled_text(self.window, 7)
         block.pack(fill='x', padx=8, pady=6)
         self.draw()
@@ -1642,6 +1934,7 @@ class FitReviewWindow:
 
     def draw(self):
         name = self.selected_region.get()
+        self.navigation.before_draw((id(self.analysis), name))
         areas = [area.name for area in self.recipe.integrals if area.parent == name]
         self.color_combo.configure(values=areas)
         if self.color_area.get() not in areas:
@@ -1649,7 +1942,14 @@ class FitReviewWindow:
         draw_spectrum(self.overview_ax, self.detail_ax, self.residual_ax,
                       self.analysis.spectrum, self.recipe, name, self.analysis, component_limit=None,
                       language=self.app.language)
+        self.navigation.after_draw()
         lines = [self.origin, 'Статус спектра: ' + self.analysis.status]
+        metadata = self.analysis.spectrum.processing_metadata
+        if metadata.get('alignment_mode') == 'global':
+            lines.append(f"Alignment to {metadata.get('alignment_reference')}: {metadata.get('alignment_shift_ppm', 0):+.6g} ppm; correlation={metadata.get('alignment_correlation', 0):.3f}")
+        elif metadata.get('alignment_mode') == 'regions':
+            for region_name, info in metadata.get('alignment_regions', {}).items():
+                lines.append(f"Alignment {region_name}: "+(info.get('error') or f"{info['shift_ppm']:+.6g} ppm; correlation={info['correlation']:.3f}"))
         for area in self.recipe.integrals:
             if area.parent == name:
                 value = self.analysis.integrals.get(area.name, float('nan'))
@@ -1829,6 +2129,7 @@ class PreprocessWindow:
         self.figure = Figure(figsize=(8, 7), dpi=100, facecolor='white')
         self.ax_apod, self.ax_base = self.figure.subplots(2, 1)
         self.figure.subplots_adjust(left=.10, right=.98, top=.94, bottom=.08, hspace=.4)
+        WheelControls(right, app, lambda: self.navigation.reset()).pack(fill='x')
         preview_controls = ttk.Frame(right, padding=4)
         preview_controls.pack(fill='x')
         self.curve_visibility = {}
@@ -1840,9 +2141,14 @@ class PreprocessWindow:
         ttk.Checkbutton(right, text='Выбирать опорные точки: левая кнопка добавляет, правая удаляет',
                         variable=self.pick_anchors, command=self.enable_anchors).pack(anchor='w', padx=5)
         self.canvas = FigureCanvasTkAgg(self.figure, master=right)
-        self.toolbar = NavigationToolbar2Tk(self.canvas, right)
+        self.toolbar = SpectrumToolbar(self.canvas, right)
         self.canvas.get_tk_widget().pack(fill='both', expand=True)
         self.canvas.mpl_connect('button_press_event', self.on_anchor_click)
+        self.canvas.mpl_connect('button_press_event', app.pick_phase_pivot)
+        self.canvas.mpl_connect('key_press_event', app.region_edit_key)
+        self.navigation = PlotNavigation(self.canvas, (self.ax_apod, self.ax_base),
+            lambda: (self.cached_result[0].ppm[0], self.cached_result[0].ppm[-1]) if self.cached_result else None,
+            app.wheel_mode_code, app.adjust_phase_wheel, lambda: app.phase_pivot_armed)
         self.lb_var.trace_add('write', lambda *_: self.changed())
         self.loading = False
         self.window.protocol('WM_DELETE_WINDOW', self.close)
@@ -1977,6 +2283,7 @@ class PreprocessWindow:
 
     def draw_cached(self):
         current, reference, local = self.cached_result
+        self.navigation.before_draw(self.app.navigation_context())
         r, b, lb = self.cached_region, self.cached_baseline, self.cached_lb
         t = self.app.t
         self.ax_apod.clear()
@@ -2012,6 +2319,8 @@ class PreprocessWindow:
             ax.grid(alpha=.15)
             if ax.lines:
                 ax.legend(fontsize=8)
+        self.app.draw_phase_pivot((self.ax_apod, self.ax_base), current)
+        self.navigation.after_draw()
         self.canvas.draw_idle()
 
     def redraw_preview(self):
@@ -2023,7 +2332,7 @@ class PreprocessWindow:
             self.fields.vars['method'].set('interp_pts')
 
     def on_anchor_click(self, event):
-        if self.toolbar.mode or not self.pick_anchors.get() or event.inaxes != self.ax_base or event.xdata is None:
+        if self.app.phase_pivot_armed or self.toolbar.mode or not self.pick_anchors.get() or event.inaxes != self.ax_base or event.xdata is None:
             return
         if self.fields.method != 'interp_pts' or not self.cached_region or event.button not in (1, 3):
             return
@@ -2086,6 +2395,10 @@ class PreprocessWindow:
             self.window.after_cancel(self.timer)
         self.window.destroy()
         self.app.preprocess_window = None
+        self.app.wheel_controls = [controls for controls in self.app.wheel_controls if controls.winfo_exists()]
+        if self.app.phase_pivot_armed:
+            self.app.phase_pivot_armed = False
+            self.app.draw(local=self.app.preview_local)
 
 
 def main():

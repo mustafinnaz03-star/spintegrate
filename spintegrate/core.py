@@ -19,6 +19,7 @@ from pybaselines import Baseline
 from scipy.optimize import least_squares
 from .appearance import AppearanceSettings, validate_appearance, validate_color
 from .baseline_methods import BASELINE_METHODS, effective_parameters, fit_baseline, parameter_specs, validate_parameters
+from .alignment import AlignmentSettings, align_regions, align_spectrum
 
 
 PHASE_MODES = ('none', 'acme', 'peak_minima', 'abs')
@@ -54,6 +55,9 @@ class ProcessingSettings:
     remove_digital_filter: bool = True
     source_mode: str = 'raw'
     pdata_procno: str = '1'
+    manual_phase_p0: float = 0.
+    manual_phase_p1: float = 0.
+    phase_pivot_fraction: float = .5
 
     def __post_init__(self):
         # Older recipes offered abs(FID). That option is intentionally retired.
@@ -103,9 +107,11 @@ class Session:
     appearance: AppearanceSettings = field(default_factory=AppearanceSettings)
     schema_version: int = 1
     analysis_method: str = 'lorentzian'
+    alignment: AlignmentSettings = field(default_factory=AlignmentSettings)
 
     def validate(self, require_regions: bool = False):
         validate_appearance(self.appearance)
+        self.alignment.validate()
         p, f = self.processing, self.fit
         if self.analysis_method not in ('lorentzian', 'direct'):
             raise ValueError('Неизвестный метод анализа: lorentzian или direct.')
@@ -159,7 +165,10 @@ class Session:
                     or not parent.low <= r.low < r.high <= parent.high):
                 raise ValueError(f'{r.name}: область интегрирования должна лежать внутри {r.parent}.')
         validate_baseline(self.baseline_default)
-        numeric = [p.p0, p.p1, p.reference_ppm, p.reference_low, p.reference_high, p.ppm_offset]
+        numeric = [p.p0, p.p1, p.reference_ppm, p.reference_low, p.reference_high, p.ppm_offset,
+                   p.manual_phase_p0, p.manual_phase_p1, p.phase_pivot_fraction]
+        if not 0 <= p.phase_pivot_fraction <= 1:
+            raise ValueError('Phase pivot must lie inside the spectrum.')
         if self.analysis_method == 'lorentzian':
             numeric += [f.initial_width_hz, f.min_width_hz, f.max_width_hz]
         if not np.isfinite(numeric).all():
@@ -183,6 +192,7 @@ class Session:
             baseline_default=BaselineSettings(**d['baseline_default']),
             appearance=AppearanceSettings(**d.get('appearance', {})),
             analysis_method=d.get('analysis_method', 'lorentzian'),
+            alignment=AlignmentSettings(**d.get('alignment', {})),
             regions=[FitRegion(**{**r, 'baseline': BaselineSettings(**r['baseline'])}) for r in d['regions']],
             integrals=[IntegrationRegion(**r) for r in d['integrals']])
         session.validate()
@@ -348,9 +358,10 @@ def process(raw: RawSpectrum | Spectrum, p: ProcessingSettings, phase_cache=None
     # Phase the original frequency data first. First-order phase and a
     # time-domain window do not commute, so applying fixed angles *after*
     # apodization would still change the result of this ordered workflow.
-    if p.phase in ('acme', 'peak_minima'):
+    if p.phase in ('acme', 'peak_minima') or has_manual_phase(p):
         base = ng.proc_base.fft(raw.fid)
         phases, resolved_notes = resolve_phase_angles(raw, p, phase_cache, reference=base)
+        phases = add_manual_phase(phases, p)
         ft = process_frequency_data(base, p, raw.sw_hz, phases)
     else:
         phases, resolved_notes = (0., 0.), []
@@ -372,9 +383,20 @@ def apodize_fid(fid, p, sw_hz):
     return fid
 
 
+def has_manual_phase(p):
+    return p.phase != 'abs' and bool(p.manual_phase_p0 or p.manual_phase_p1)
+
+
+def add_manual_phase(phases, p):
+    if p.phase == 'abs':
+        return phases
+    return (phases[0]+p.manual_phase_p0-p.manual_phase_p1*p.phase_pivot_fraction,
+            phases[1]+p.manual_phase_p1)
+
+
 def process_frequency_data(base, p, sw_hz, phases, *, positive=False):
     """Phase original frequency data before any additional apodization."""
-    if p.phase in ('acme', 'peak_minima'):
+    if p.phase in ('acme', 'peak_minima') or has_manual_phase(p):
         phased = ng.proc_base.ps(base, p0=phases[0], p1=phases[1])
     else:
         phased = np.asarray(base).copy()
@@ -400,6 +422,9 @@ def spectrum_from_fourier(ft, p, sf_mhz, sw_hz, carrier_ppm, source, phases, not
     frequencies = np.fft.fftshift(np.fft.fftfreq(len(ft), d=1/sw_hz))
     ppm = carrier_ppm + frequencies / sf_mhz
     ppm, reference_notes, reference_info = reference_axis(ppm, ft, p, intensity=y)
+    reference_info.update(manual_phase_p0_deg=0. if p.phase == 'abs' else p.manual_phase_p0,
+                          manual_phase_p1_deg=0. if p.phase == 'abs' else p.manual_phase_p1,
+                          phase_pivot_fraction=p.phase_pivot_fraction)
     notes.extend(reference_notes)
     order = np.argsort(ppm)
     if not np.isfinite(y).all():
@@ -676,14 +701,20 @@ def direct_region(spectrum: Spectrum, region: FitRegion) -> FitResult:
                           baseline_parameters=asdict(region.baseline)))
 
 
-def analyze(spectrum: Spectrum, session: Session) -> Analysis:
+def analyze(spectrum: Spectrum, session: Session, region_spectra=None, region_errors=None) -> Analysis:
     session.validate(require_regions=True)
-    results, errors = {}, {}
+    results, errors = {}, dict(region_errors or {})
     notes = list(spectrum.notes)
+    notes.extend(f'{name}: {message}' for name, message in errors.items())
     for region in session.regions:
+        if region.name in errors:
+            continue
         try:
-            result = (direct_region(spectrum, region) if session.analysis_method == 'direct'
-                      else fit_region(spectrum, region, session))
+            source = (region_spectra or {}).get(region.name, spectrum)
+            result = (direct_region(source, region) if session.analysis_method == 'direct'
+                      else fit_region(source, region, session))
+            if source.processing_metadata.get('alignment'):
+                result.diagnostics['alignment'] = source.processing_metadata['alignment']
             results[region.name] = result
             notes.extend(f'{region.name}: {n}' for n in result.notes)
             if not result.success:
@@ -903,6 +934,20 @@ def batch_analyze(root, session: Session, csv_path, progress: Callable | None = 
         raise ValueError('Не найдены папки с fid + acqus или демонстрационные .npz.')
     root = Path(root)
     csv_path = Path(csv_path)
+    reference, first_alignment, reference_id = None, None, ''
+    if session.alignment.enabled:
+        reference_id = paths[0].relative_to(root).as_posix()
+        try:
+            reference = process(load_source(paths[0], session.processing), session.processing)
+            if session.alignment.mode == 'global':
+                aligned, info = align_spectrum(reference, reference, session.alignment, reference_id, first=True)
+                first_alignment = (aligned, None, {}, info)
+            else:
+                first_alignment = align_regions(reference, reference, session, reference_id, first=True)
+                if len(first_alignment[2]) == len(session.regions):
+                    raise ValueError('No processing region in the first spectrum can be aligned.')
+        except Exception as exc:
+            raise ValueError(f'Cannot align to the first spectrum ({reference_id}): {exc}') from exc
     # Save the exact recipe alongside the table for reproducibility.
     session.save(csv_path.with_suffix('.settings.json'))
     fit_directory = csv_path.with_suffix('.fits')
@@ -919,12 +964,34 @@ def batch_analyze(root, session: Session, csv_path, progress: Callable | None = 
                    spectrum_id=ident, source_path=str(path.resolve()), fit_file='',
                    analysis_method=session.analysis_method, source_mode=session.processing.source_mode,
                    status='error', warnings='', phase_p0_deg='', phase_p1_deg='',
-                   peak_count='', max_relative_rmse='', reference_shift_ppm='')
+                   peak_count='', max_relative_rmse='', reference_shift_ppm='',
+                   alignment_mode=session.alignment.mode if session.alignment.enabled else 'off',
+                   alignment_reference=reference_id, alignment_shift_ppm='', alignment_correlation='',
+                   alignment_max_abs_shift_ppm='')
         row.update({f'integral__{r.name}': float('nan') for r in session.integrals})
         details = dict(spectrum_id=ident, errors={}, diagnostics={})
         try:
-            raw = load_source(path, session.processing)
-            analysis = analyze(process(raw, session.processing), session)
+            region_views, alignment_errors = None, {}
+            if session.alignment.enabled and number == 1:
+                spectrum, region_views, alignment_errors, alignment_info = first_alignment
+            else:
+                spectrum = process(load_source(path, session.processing), session.processing)
+                if session.alignment.enabled:
+                    if session.alignment.mode == 'global':
+                        spectrum, alignment_info = align_spectrum(reference, spectrum, session.alignment, reference_id)
+                    else:
+                        spectrum, region_views, alignment_errors, alignment_info = align_regions(reference, spectrum, session, reference_id)
+            if session.alignment.enabled:
+                details['alignment'] = alignment_info
+                if session.alignment.mode == 'global':
+                    row.update(alignment_shift_ppm=alignment_info['shift_ppm'],
+                               alignment_correlation=alignment_info['correlation'],
+                               alignment_max_abs_shift_ppm=abs(alignment_info['shift_ppm']))
+                else:
+                    valid = [info for info in alignment_info.values() if 'shift_ppm' in info]
+                    row.update(alignment_correlation=min((info['correlation'] for info in valid), default=''),
+                               alignment_max_abs_shift_ppm=max((abs(info['shift_ppm']) for info in valid), default=''))
+            analysis = analyze(spectrum, session, region_views, alignment_errors)
             row.update({f'integral__{n}': v for n, v in analysis.integrals.items()})
             row.update(status=analysis.status, warnings=' | '.join(analysis.notes),
                        phase_p0_deg=analysis.spectrum.phases[0], phase_p1_deg=analysis.spectrum.phases[1],
