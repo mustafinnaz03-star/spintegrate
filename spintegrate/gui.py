@@ -937,8 +937,19 @@ class SpintegrateApp:
     def fit_settings_changed(self):
         if self.loading_settings:
             return
+        previous_mode = self.session.analysis_method
         self.update_analysis_controls()
         self.invalidate()
+        if previous_mode != self.session.analysis_method:
+            # Discard old preview requests and artists before another worker runs.
+            self.preview_revision += 1
+            self.pending_preview = None
+            self.region_dragging = False
+            if self.session.analysis_method == 'lorentzian_manual':
+                self.manual_peak_edit.set(True)
+                self.toggle_manual_peaks()
+            else:
+                self.draw()
         self.schedule_preview()
 
     def anchor_reference(self):
@@ -1006,6 +1017,8 @@ class SpintegrateApp:
             region.manual_peaks = sorted(float(v) for v in peaks)
             recipe.validate()
             if old == region.manual_peaks:
+                self.manual_peak_text.set('; '.join(f'{v:.8g}' for v in region.manual_peaks))
+                self.draw(local=self.preview_local)
                 return
             if record:
                 self.manual_peak_history.append((region.name, old))
@@ -1271,7 +1284,8 @@ class SpintegrateApp:
                 local = (x, y, corrected, baseline, peaks, notes)
             return spectrum, local
         def ready(result):
-            if revision != self.preview_revision:
+            if (revision != self.preview_revision or generation != self.generation
+                    or recipe.analysis_method != self.session.analysis_method):
                 return
             self.session.processing = recipe.processing
             self.session.fit = recipe.fit

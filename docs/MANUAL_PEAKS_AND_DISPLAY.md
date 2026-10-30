@@ -7,13 +7,15 @@ Both features work in the **raw** and **pdata** workspaces. Old recipes retain a
 1. Load a spectrum and adjust phase, apodization and referencing. For a batch, start with the **first spectrum in the discovered batch list**, since it will define the alignment reference.
 2. Save processing regions with their local baseline parameters, then save the smaller integration regions inside them.
 3. In **Fitting → Analysis method**, choose **Lorentzian fit: manual peaks** (**Лоренцы: ручной выбор пиков**).
-4. Select a saved processing region in **Regions**, then enable **Mark peaks** above the plot. Each processing region keeps its own marks.
+4. Select a saved processing region in **Regions**. Switching the method chooser to manual fitting enables **Mark peaks** automatically; you can also toggle it above the plot. Each processing region keeps its own marks.
 5. **Left-click** adds an initial center at the clicked ppm coordinate. **Right-click** removes a mark within 14 display pixels. **Ctrl+Z** or **Undo peak edit** restores the previous mark list; **Clear peaks** removes all marks in the selected region. **Esc** leaves marking mode. Wheel navigation is still available.
 6. To enter exact positions, type values such as `3.544; 3.595` into **Initial ppm** and click **Apply peaks** or press Enter. Use a decimal point. Marks must be unique and strictly inside the processing region.
 7. Set **Center tolerance ±, ppm** in Fitting. The default is **0.03 ppm**. This is the residual center movement allowed after batch alignment, rather than the maximum alignment shift.
 8. Click **Run analysis**. To reuse the marks and settings, click **Use for batch** or save the JSON recipe.
 
 Disable Mark peaks to draw new regions with the mouse. Manual peak marking, saved-region dragging and phase-pivot selection are separate interaction modes. Moving a processing region translates its marks together with its integration regions; shrinking it protects existing marks. Geometry undo restores their coordinates. Peak-edit history clears when the region geometry changes.
+
+Switching from automatic fitting immediately removes the previous fit and its automatic peak markers. Manual previews display only saved manual marks, even if an older background preview finishes later. Previously saved manual marks survive switching away and back, and remain editable; automatic picks are never copied into them. **Clear peaks** also refreshes the plot when the manual list is already empty.
 
 ![Native-DPI interface showing manual initial marks and optimized centers on synthetic data](images/manual_peaks.png)
 
@@ -54,3 +56,5 @@ The startup order follows Microsoft's [DPI-awareness API guidance](https://learn
 `tests/test_manual_peaks.py` covers positive/signed peaks, linear/robust losses, fitted-center membership in integrals, bounded drift, local baselines, old JSON defaults, region geometry and raw/pdata batch alignment in both modes. `tests/manual_peaks_gui_smoke.py` exercises actual clicks, deletion/undo, numeric marks, language switching, frozen recipes, CSV, archives and reconstruction.
 
 `tests/display_gui_smoke.py` runs with native Windows DPI awareness and checks backing-store/axes bounds, resizing, 80–150% UI scale, sidebar collapse, preview/review plots and unchanged fit arrays/export pixel dimensions. All verification data are synthetic.
+
+`tests/test_peak_mode_switch.py` and `tests/peak_mode_switch_gui_smoke.py` check that old automatic fit/preview markers cannot appear as manual peaks. The GUI regression covers immediate switching, a delayed automatic worker, deletion, clearing after a manual fit and preserving intentionally saved manual marks in both raw and pdata.

@@ -26,6 +26,8 @@ def _direct_integrals(detail, cumulative, x, y, session, parent, t, show_region_
 
 def draw_spectrum(overview, detail, residual, spectrum, session, selected_region,
                   analysis=None, local=None, component_limit=60, language=None, show_region_names=True):
+    if analysis is not None and analysis.method != session.analysis_method:
+        analysis = None
     language = language or session.appearance.language
     t = lambda text: tr(text, language)
     direct = (getattr(analysis, 'method', None) == 'direct'
@@ -96,6 +98,11 @@ def draw_spectrum(overview, detail, residual, spectrum, session, selected_region
             detail.set_title(t(title), fontsize=10, loc='left')
     elif local:
         x, raw, y, line, peaks, _ = local
+        if manual:
+            # A cached local preview may still contain automatic peak picks.
+            # Only saved manual marks are editable or meaningful in this mode.
+            centers = np.sort(np.asarray(region.manual_peaks if region else [], dtype=float))
+            peaks = (centers, np.interp(centers, x, y))
         detail.plot(x, raw, color='#b0b9c5', lw=.9, label=t('До базовой линии'))
         detail.plot(x, line, color='#d26335', lw=1., label=t('Базовая линия'))
         detail.plot(x, y, color='#254b79', lw=1., label=t('После коррекции'))
