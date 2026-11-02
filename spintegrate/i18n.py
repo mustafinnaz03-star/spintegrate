@@ -6,6 +6,29 @@ from tkinter import ttk
 
 
 EN = {
+    'Фаза серии': 'Batch phase', 'Независимо в каждом спектре': 'Independently for each spectrum',
+    'Постоянная с выбранного спектра': 'Fixed from the selected spectrum',
+    'Взять текущую фазу': 'Capture current phase', 'Зафиксировать фазу → серия': 'Freeze phase for batch',
+    'Фаза определяется заново в каждом спектре; ручные поправки повторяются.':
+        'Phase is resolved separately for each spectrum; manual offsets are repeated.',
+    'Сначала нажмите «Взять текущую фазу» или «Запомнить → серия» с открытым спектром.':
+        'Capture current phase, or click Use for batch with a spectrum open.',
+    'Фаза серии ещё не зафиксирована.': 'Batch phase has not been captured yet.',
+    'Сначала зафиксируйте фазу выбранного спектра для серии.': 'Capture the selected spectrum’s phase for the batch first.',
+    'Фиксирую фазу выбранного спектра для всей серии…': 'Capturing the selected spectrum’s phase for the batch…',
+    'Дождитесь фиксации фазы выбранного спектра.': 'Wait for the selected spectrum’s phase to be captured.',
+    'Дождитесь окончания серии перед заменой фиксированной фазы.': 'Wait for the batch to finish before replacing its fixed phase.',
+    'Дождитесь загрузки спектра с текущими настройками перед фиксацией фазы.':
+        'Wait until the spectrum is loaded with the current settings before capturing phase.',
+    'В режиме abs фаза не определяется. Выберите фазировку перед фиксацией для серии.':
+        'abs mode has no phase to capture. Select a phasing mode first.',
+    'Фиксированная фаза серии несовместима с abs. Выберите независимую обработку фазы.':
+        'Fixed batch phase cannot be combined with abs. Select independent phase processing.',
+    'Источник фиксированной фазы должен совпадать с режимом raw/pdata серии.':
+        'The fixed phase source must match the batch raw/pdata mode.',
+    'Некорректный режим фазировки серии.': 'Invalid batch phase mode.',
+    'Фаза серии P0/P1 должна содержать конечные числа.': 'Batch P0/P1 must be finite numbers.',
+    'Некорректный источник фиксированной фазы.': 'Invalid fixed phase source.',
     'Масштаб UI': 'UI scale', 'Скрыть настройки': 'Hide settings', 'Показать настройки': 'Show settings',
     'Развернуть окно': 'Maximize / restore',
     'Масштаб интерфейса: 80, 90, 100, 110, 125 или 150%.': 'UI scale: 80, 90, 100, 110, 125 or 150%.',
@@ -315,6 +338,11 @@ EN = {
 
 # Capture already-formatted arguments without changing user-controlled names.
 TEMPLATES = {
+    'Постоянная фаза: P0={p0}°, P1={p1}°; источник: {source}. Автофаза в серии отключена.':
+        'Fixed phase: P0={p0}°, P1={p1}°; source: {source}. No automatic phasing in the batch.',
+    'Фаза для серии зафиксирована: P0={p0}°, P1={p1}°. Автофаза повторяться не будет.':
+        'Batch phase captured: P0={p0}°, P1={p1}°. Automatic phasing will not run again.',
+    'Фаза серии фиксирована: P0={p0}°, P1={p1}°.': 'Fixed batch phase: P0={p0}°, P1={p1}°.',
     '{name}: {n} пиков': '{name}: {n} peaks',
     '{name}: сначала отметьте ручные пики.': '{name}: mark manual peaks first.',
     '{name}: ручные пики должны быть уникальными и строго внутри области.': '{name}: manual peaks must be unique and strictly inside the region.',

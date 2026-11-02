@@ -22,6 +22,7 @@ from scipy.optimize import least_squares
 from .appearance import AppearanceSettings, validate_appearance, validate_color
 from .baseline_methods import BASELINE_METHODS, effective_parameters, fit_baseline, parameter_specs, validate_parameters
 from .alignment import AlignmentSettings, align_regions, align_spectrum
+from .phase_transfer import BatchPhaseSettings, batch_processing_settings, process_for_batch
 
 
 PHASE_MODES = ('none', 'acme', 'peak_minima', 'abs')
@@ -112,10 +113,12 @@ class Session:
     schema_version: int = 1
     analysis_method: str = 'lorentzian'
     alignment: AlignmentSettings = field(default_factory=AlignmentSettings)
+    batch_phase: BatchPhaseSettings = field(default_factory=BatchPhaseSettings)
 
     def validate(self, require_regions: bool = False):
         validate_appearance(self.appearance)
         self.alignment.validate()
+        self.batch_phase.validate()
         p, f = self.processing, self.fit
         if self.analysis_method not in ('lorentzian', 'lorentzian_manual', 'direct'):
             raise ValueError('Неизвестный метод анализа: lorentzian, lorentzian_manual или direct.')
@@ -208,6 +211,7 @@ class Session:
             appearance=AppearanceSettings(**d.get('appearance', {})),
             analysis_method=d.get('analysis_method', 'lorentzian'),
             alignment=AlignmentSettings(**d.get('alignment', {})),
+            batch_phase=BatchPhaseSettings(**d.get('batch_phase', {})),
             regions=[FitRegion(**{**r, 'baseline': BaselineSettings(**r['baseline'])}) for r in d['regions']],
             integrals=[IntegrationRegion(**r) for r in d['integrals']])
         session.validate()
@@ -989,6 +993,7 @@ def batch_analyze(root, session: Session, csv_path, progress: Callable | None = 
         session = copy.deepcopy(session)
         session.alignment.enabled = True
     session.validate(require_regions=True)
+    batch_processing_settings(session)  # fail before writing if fixed phase is not ready
     paths = discover_spectra(root, recursive, session.processing.source_mode, session.processing.pdata_procno)
     if not paths:
         if session.processing.source_mode == 'pdata':
@@ -1000,7 +1005,7 @@ def batch_analyze(root, session: Session, csv_path, progress: Callable | None = 
     if session.alignment.enabled:
         reference_id = paths[0].relative_to(root).as_posix()
         try:
-            reference = process(load_source(paths[0], session.processing), session.processing)
+            reference = process_for_batch(load_source(paths[0], session.processing), session)
             if session.alignment.mode == 'global':
                 aligned, info = align_spectrum(reference, reference, session.alignment, reference_id, first=True)
                 first_alignment = (aligned, None, {}, info)
@@ -1037,7 +1042,7 @@ def batch_analyze(root, session: Session, csv_path, progress: Callable | None = 
             if session.alignment.enabled and number == 1:
                 spectrum, region_views, alignment_errors, alignment_info = first_alignment
             else:
-                spectrum = process(load_source(path, session.processing), session.processing)
+                spectrum = process_for_batch(load_source(path, session.processing), session)
                 if session.alignment.enabled:
                     if session.alignment.mode == 'global':
                         spectrum, alignment_info = align_spectrum(reference, spectrum, session.alignment, reference_id)

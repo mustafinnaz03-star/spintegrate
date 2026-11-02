@@ -33,6 +33,7 @@ from .baseline_ui import BaselineControls
 from .region_editing import RegionHistory, move_or_resize
 from .alignment import AlignmentSettings, align_regions, align_spectrum
 from .navigation import PlotNavigation
+from .phase_transfer import batch_processing_settings, capture_batch_phase, process_for_batch
 from .desktop_display import (SURFACE, UI_SCALES, SpectrumCanvas, apply_style, display_factor, enable_windows_dpi,
                               fit_window, scale_explicit_fonts, style_live_figure)
 
@@ -46,6 +47,7 @@ ANALYSIS_LABELS = {'Деконволюция Лоренцами': 'lorentzian',
                    'Прямое интегрирование областей': 'direct'}
 WHEEL_MODES = {'Интенсивность': 'intensity', 'Масштаб ppm': 'ppm', 'Фаза P0': 'phase_p0', 'Фаза P1': 'phase_p1'}
 ALIGNMENT_MODES = {'Единый сдвиг спектра': 'global', 'По областям обработки': 'regions'}
+BATCH_PHASE_MODES = {'Независимо в каждом спектре': 'per_spectrum', 'Постоянная с выбранного спектра': 'fixed'}
 
 
 class SpectrumToolbar(NavigationToolbar2Tk):
@@ -168,6 +170,69 @@ class AlignmentControls(ttk.LabelFrame):
                 self.app._recipe_description()
         except ValueError as exc:
             self.app.status.set(str(exc))
+
+
+class BatchPhaseControls(ttk.LabelFrame):
+    def __init__(self, parent, app):
+        super().__init__(parent, text='Фаза серии', padding=6)
+        self.app, self.loading = app, True
+        self.profile = copy.deepcopy(app.session.batch_phase)
+        self.mode = tk.StringVar(self)
+        self.combo = ttk.Combobox(self, textvariable=self.mode, state='readonly', width=35)
+        self.combo.grid(row=0, column=0, sticky='w')
+        self.capture_button = ttk.Button(self, text='Взять текущую фазу', command=app.freeze_phase_for_batch)
+        self.capture_button.grid(row=0, column=1, padx=8, sticky='w')
+        self.summary = ttk.Label(self, wraplength=1000, foreground='#65758a')
+        self.summary.grid(row=1, column=0, columnspan=3, sticky='w', pady=(4, 0))
+        self.mode.trace_add('write', lambda *_: self.changed())
+        self.set_values(app.session.batch_phase)
+        self.loading = False
+
+    def translate_choices(self, language):
+        loading, self.loading = self.loading, True
+        self.combo.configure(values=[tr(label, language) for label in BATCH_PHASE_MODES])
+        self.mode.set(tr(canonical(self.mode.get()), language))
+        self.loading = loading
+
+    def read(self):
+        profile = copy.deepcopy(self.profile)
+        profile.mode = BATCH_PHASE_MODES[canonical(self.mode.get())]
+        profile.validate()
+        return profile
+
+    def set_values(self, settings):
+        loading, self.loading = self.loading, True
+        self.profile = copy.deepcopy(settings)
+        self.mode.set(self.app.t(next(label for label, code in BATCH_PHASE_MODES.items() if code == settings.mode)))
+        self.translate_choices(self.app.language)
+        self.loading = loading
+        self.refresh_states()
+
+    def refresh_states(self):
+        busy = self.app.batch_running or 'capture_batch_phase' in self.app.jobs
+        self.combo.configure(state='disabled' if busy else 'readonly')
+        active = not busy and self.app.raw is not None
+        self.capture_button.configure(state='normal' if active else 'disabled')
+        self.app.freeze_phase_button.configure(state='normal' if active else 'disabled')
+        profile = self.read()
+        if profile.mode == 'per_spectrum':
+            text = 'Фаза определяется заново в каждом спектре; ручные поправки повторяются.'
+        elif not profile.captured:
+            text = 'Сначала нажмите «Взять текущую фазу» или «Запомнить → серия» с открытым спектром.'
+        else:
+            text = (f'Постоянная фаза: P0={profile.p0:.6g}°, P1={profile.p1:.6g}°; '
+                    f'источник: {Path(profile.source).name}. Автофаза в серии отключена.')
+        set_label(self.summary, text)
+
+    def changed(self):
+        if self.loading or self.app.loading_settings:
+            return
+        profile = self.read()
+        self.app.session.batch_phase = profile
+        if self.app.batch_recipe is not None:
+            self.app.batch_recipe.batch_phase = copy.deepcopy(profile)
+            self.app._recipe_description()
+        self.refresh_states()
 
 
 class FieldPanel(ttk.Frame):
@@ -438,6 +503,8 @@ class SpintegrateApp:
         ttk.Button(processing_tab, text='Сбросить ручную фазу', command=self.reset_manual_phase).pack(fill='x', padx=8, pady=3)
         self.phase_summary = ttk.Label(processing_tab, text='Фаза ещё не определена.', wraplength=365)
         self.phase_summary.pack(fill='x', padx=8, pady=3)
+        self.freeze_phase_button = ttk.Button(processing_tab, text='Зафиксировать фазу → серия', command=self.freeze_phase_for_batch)
+        self.freeze_phase_button.pack(fill='x', padx=8, pady=5)
         explanation = ('P0/P1 — старт автоматического фазирования. «Без коррекции» показывает реальную часть FFT.\n'
                        'LB настраивается в отдельном окне.' if self.source_mode == 'raw' else
                        'По умолчанию используются 1r и ppm-шкала TopSpin. Фазы PHC0/PHC1 повторно не применяются. '
@@ -624,6 +691,8 @@ class SpintegrateApp:
         ttk.Button(paths, text='Выбрать…', command=self.choose_batch_output).grid(row=1, column=2, padx=6)
         ttk.Checkbutton(frame, text='Искать эксперименты во вложенных папках',
                         variable=self.batch_recursive).pack(anchor='w')
+        self.batch_phase_controls = BatchPhaseControls(frame, self)
+        self.batch_phase_controls.pack(fill='x', pady=6)
         self.alignment_controls = AlignmentControls(frame, self)
         self.alignment_controls.pack(fill='x', pady=6)
         buttons = ttk.Frame(frame)
@@ -679,6 +748,7 @@ class SpintegrateApp:
         self.fit_fields.set_values({'analysis_label': next(k for k, v in ANALYSIS_LABELS.items()
                                                          if v == self.session.analysis_method)})
         self.alignment_controls.set_values(self.session.alignment)
+        self.batch_phase_controls.set_values(self.session.batch_phase)
         self.update_analysis_controls()
         self.loading_settings = False
         self.refresh_regions()
@@ -782,6 +852,7 @@ class SpintegrateApp:
         if self.preprocess_window and self.preprocess_window.window.winfo_exists():
             self.preprocess_window.store_controls()
         s = copy.deepcopy(self.session)
+        s.batch_phase = self.batch_phase_controls.read()
         p = self.processing_fields.values()
         p['phase'] = PHASE_LABELS[canonical(p.pop('phase_label'))]
         p['reference_mode'] = REF_LABELS[canonical(p.pop('reference_label'))]
@@ -823,6 +894,8 @@ class SpintegrateApp:
         self.rephase_button.configure(state='normal' if phase in ('acme', 'peak_minima') else 'disabled')
         for key in ('manual_phase_p0', 'manual_phase_p1'):
             self.processing_fields.enable(key, phase != 'abs')
+        if hasattr(self, 'batch_phase_controls'):
+            self.batch_phase_controls.refresh_states()
 
     def wheel_mode_code(self):
         return WHEEL_MODES.get(canonical(self.wheel_mode.get()), 'intensity')
@@ -866,6 +939,39 @@ class SpintegrateApp:
         self.loading_settings = False
         self.phase_pivot_armed = False
         self.settings_changed()
+
+    def freeze_phase_for_batch(self, recipe=None, remember=False):
+        if self.batch_running:
+            return self.error('Дождитесь окончания серии перед заменой фиксированной фазы.')
+        if 'capture_batch_phase' in self.jobs:
+            self.status.set('Дождитесь фиксации фазы выбранного спектра.')
+            return
+        if self.raw is None:
+            return self.error('Сначала загрузите спектр.')
+        try:
+            recipe = copy.deepcopy(recipe) if recipe is not None else self.read_settings()
+            if recipe.processing.phase == 'abs':
+                raise ValueError('В режиме abs фаза не определяется. Выберите фазировку перед фиксацией для серии.')
+            if (self.source_path and ((self.source_mode == 'raw' and self.loaded_filter != recipe.processing.remove_digital_filter)
+                    or (self.source_mode == 'pdata' and str(recipe.processing.pdata_procno) != self.loaded_procno))):
+                raise ValueError('Дождитесь загрузки спектра с текущими настройками перед фиксацией фазы.')
+        except ValueError as exc:
+            return self.error(str(exc))
+        raw, state = self.raw, self.phase_state
+        def ready(profile):
+            recipe.batch_phase = profile
+            if remember:
+                self._remember_batch_recipe(recipe)
+            else:
+                self.session.batch_phase = copy.deepcopy(profile)
+                self.batch_phase_controls.set_values(profile)
+                if self.batch_recipe is not None:
+                    self.batch_recipe.batch_phase = copy.deepcopy(profile)
+                    self._recipe_description()
+                self.status.set(f'Фаза для серии зафиксирована: P0={profile.p0:.6g}°, P1={profile.p1:.6g}°. Автофаза повторяться не будет.')
+        self.status.set('Фиксирую фазу выбранного спектра для всей серии…')
+        self.submit('capture_batch_phase', lambda: capture_batch_phase(raw, recipe.processing, state), ready, self.generation)
+        self.batch_phase_controls.refresh_states()
 
     def arm_phase_pivot(self):
         if self.raw is None:
@@ -1147,6 +1253,8 @@ class SpintegrateApp:
                 continue
             del self.jobs[name]
             if generation is not None and generation != self.generation:
+                if name == 'capture_batch_phase':
+                    self.batch_phase_controls.refresh_states()
                 continue
             try:
                 callback(future.result())
@@ -1156,6 +1264,9 @@ class SpintegrateApp:
                 if name == 'fit':
                     self.fit_button.configure(state='normal')
                 self.error(str(exc))
+            finally:
+                if name == 'capture_batch_phase':
+                    self.batch_phase_controls.refresh_states()
         while True:
             try:
                 message = self.queue.get_nowait()
@@ -1213,6 +1324,7 @@ class SpintegrateApp:
         remove_filter = recipe.processing.remove_digital_filter
         def loaded(raw):
             self.raw = raw
+            self.batch_phase_controls.refresh_states()
             self.loaded_filter = remove_filter
             self.loaded_procno = str(recipe.processing.pdata_procno)
             set_label(self.source_label, raw.source)
@@ -1291,6 +1403,7 @@ class SpintegrateApp:
             self.session.fit = recipe.fit
             self.session.analysis_method = recipe.analysis_method
             self.spectrum, local = result
+            self.batch_phase_controls.refresh_states()
             set_label(self.phase_summary, f'Фаза P0={self.spectrum.phases[0]:.3f}°, P1={self.spectrum.phases[1]:.3f}°. '
                       'Сохраняется при изменении LB.')
             self.preview_local = local
@@ -1785,14 +1898,21 @@ class SpintegrateApp:
         try:
             recipe = self.read_settings()
             recipe.validate(require_regions=True)
-            self.session = recipe
-            self.batch_recipe = copy.deepcopy(recipe)
-            self.alignment_controls.set_values(recipe.alignment)
-            self._recipe_description()
-            self.tabs.select(self.batch_tab)
-            self.status.set('Параметры запомнены для серии. Последующие изменения одиночного анализа не изменят этот снимок.')
+            if recipe.batch_phase.mode == 'fixed' and not recipe.batch_phase.captured and self.raw is not None:
+                return self.freeze_phase_for_batch(recipe, remember=True)
+            batch_processing_settings(recipe)
+            self._remember_batch_recipe(recipe)
         except ValueError as exc:
             self.error(str(exc))
+
+    def _remember_batch_recipe(self, recipe):
+        self.session = recipe
+        self.batch_recipe = copy.deepcopy(recipe)
+        self.alignment_controls.set_values(recipe.alignment)
+        self.batch_phase_controls.set_values(recipe.batch_phase)
+        self._recipe_description()
+        self.tabs.select(self.batch_tab)
+        self.status.set('Параметры запомнены для серии. Последующие изменения одиночного анализа не изменят этот снимок.')
 
     def _recipe_description(self):
         s = self.batch_recipe
@@ -1819,7 +1939,12 @@ class SpintegrateApp:
             reference += f'\nОкно поиска референса: {p.reference_low:g}…{p.reference_high:g} ppm.'
         alignment = ('Выравнивание: выключено.' if not s.alignment.enabled else
                      f'Выравнивание к первому спектру: {s.alignment.mode}; максимум {s.alignment.max_shift_ppm:g} ppm.')
-        set_label(self.recipe_label, intro + text + '\n' + reference + '\n' + alignment)
+        phase = s.batch_phase
+        phase_text = (f'Фаза серии фиксирована: P0={phase.p0:.6g}°, P1={phase.p1:.6g}°.'
+                      if phase.mode == 'fixed' and phase.captured else
+                      'Фаза серии ещё не зафиксирована.' if phase.mode == 'fixed' else
+                      'Фаза определяется заново в каждом спектре; ручные поправки повторяются.')
+        set_label(self.recipe_label, intro + text + '\n' + reference + '\n' + alignment + '\n' + phase_text)
 
     def toggle_recipe_details(self):
         self.recipe_details_open = not self.recipe_details_open
@@ -1920,6 +2045,8 @@ class SpintegrateApp:
     def run_batch(self):
         if self.batch_running:
             return
+        if 'capture_batch_phase' in self.jobs:
+            return self.error('Дождитесь фиксации фазы выбранного спектра.')
         if 'load_batch_results' in self.jobs:
             return self.error('Дождитесь загрузки открываемого CSV перед запуском новой серии.')
         if self.batch_recipe is None:
@@ -1927,7 +2054,9 @@ class SpintegrateApp:
         try:
             recipe = copy.deepcopy(self.batch_recipe)
             recipe.alignment = self.alignment_controls.read(recipe.alignment, required=recipe.analysis_method == 'lorentzian_manual')
+            recipe.batch_phase = self.batch_phase_controls.read()
             recipe.validate(require_regions=True)
+            batch_processing_settings(recipe)
             root = self.batch_root.get()
             paths = discover_spectra(root, self.batch_recursive.get(), recipe.processing.source_mode,
                                      recipe.processing.pdata_procno)
@@ -1946,6 +2075,7 @@ class SpintegrateApp:
             return self.error(str(exc))
         self.batch_running = True
         self.alignment_controls.refresh_states()
+        self.batch_phase_controls.refresh_states()
         self.batch_cancel.clear()
         self.batch_rows.clear()
         self.batch_results_recipe = copy.deepcopy(recipe)
@@ -1972,6 +2102,7 @@ class SpintegrateApp:
     def _batch_unlock(self):
         self.batch_running = False
         self.alignment_controls.refresh_states()
+        self.batch_phase_controls.refresh_states()
         self.batch_button.configure(state='normal')
         self.cancel_button.configure(state='disabled')
 
@@ -2069,11 +2200,11 @@ class SpintegrateApp:
         reference_source = reference_row.get('source_path') if reference_row else None
         def work():
             raw = load_source(source, recipe.processing)
-            spectrum = process(raw, recipe.processing)
+            spectrum = process_for_batch(raw, recipe)
             if recipe.alignment.enabled:
                 if not reference_source or not Path(reference_source).exists():
                     raise ValueError('The first reference spectrum is required to reconstruct an aligned result.')
-                reference = process(load_source(reference_source, recipe.processing), recipe.processing)
+                reference = process_for_batch(load_source(reference_source, recipe.processing), recipe)
                 first = Path(source).resolve() == Path(reference_source).resolve()
                 if recipe.alignment.mode == 'global':
                     spectrum, _ = align_spectrum(reference, spectrum, recipe.alignment, reference_id, first)
@@ -2195,6 +2326,9 @@ class FitReviewWindow:
         self.navigation.after_draw()
         lines = [self.origin, 'Статус спектра: ' + self.analysis.status]
         metadata = self.analysis.spectrum.processing_metadata
+        fixed_phase = metadata.get('batch_phase')
+        if fixed_phase:
+            lines.append(f"Фаза серии фиксирована: P0={fixed_phase['p0']:.6g}°, P1={fixed_phase['p1']:.6g}°.")
         if metadata.get('alignment_mode') == 'global':
             lines.append(f"Alignment to {metadata.get('alignment_reference')}: {metadata.get('alignment_shift_ppm', 0):+.6g} ppm; correlation={metadata.get('alignment_correlation', 0):.3f}")
         elif metadata.get('alignment_mode') == 'regions':
